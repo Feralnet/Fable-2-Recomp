@@ -248,6 +248,16 @@ dog_fur_depth_bias = true
 # every call); 0 = never yield; larger = fewer context switches.
 # Default: 1
 hotfunc_yield_every = 1
+
+# Idle yield sleep, in microseconds. Some guest threads wait for each other
+# by calling NtYieldExecution in a tight loop, which pins a CPU core at 100%
+# even when the game is idle (menus, loading, videos). When a thread yields
+# back to back with no work in between, it sleeps this long per yield
+# instead. The game's frame limiter, which busy-waits for the rest of every
+# frame, sleeps the same amount between polls. 0 = never sleep (original
+# behaviour). Leave commented out to use the platform default.
+# Default: 0 on Windows, 100 elsewhere
+# idle_yield_sleep_us = 100
 )TOML_EOF";
 
 std::string_view TypeName(toml::node_type t) {
@@ -434,6 +444,9 @@ bool Load(const std::filesystem::path& path) {
     values.hotfunc_yield_every = static_cast<int32_t>(Read<int64_t>(
         perf_table, "perf", "hotfunc_yield_every", "integer",
         values.hotfunc_yield_every));
+    values.idle_yield_sleep_us = static_cast<int32_t>(Read<int64_t>(
+        perf_table, "perf", "idle_yield_sleep_us", "integer",
+        values.idle_yield_sleep_us));
   }
 
   g_values = values;
