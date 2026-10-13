@@ -25,6 +25,9 @@ fable2_func_summary.log
 fable2_func_summary_prev.log
 fps_probe.log
 
+# --- Desktop launcher written by ./run.sh --make-shortcut (absolute paths) ---
+/Fable II.desktop
+
 # --- SDK / runtime artifacts ------------------------------------------------
 .fable2_image.bin
 
@@ -45,6 +48,12 @@ rebuild.log
 rebuild2.log
 __pycache__/
 
+# --- Linux build/run entry points (tracked DESPITE the /*.sh rule above) ------
+# Upstream master dropped the older "build-critical scripts" negation block, and
+# the helper files it listed stay tracked regardless. These two are root .sh
+# files, which /*.sh would otherwise ignore.
+!build.sh
+!run.sh
 # --- Fetched/external toolchain deps (created by tools/setup_sdk*.cmd). -------
 # The tracked files in thirdparty/ (rexglue-sdk-local.patch,
 # rexglue-sdk-submodule-pins.txt, vulkan/, vk_video/) stay in the repo.
