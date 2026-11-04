@@ -375,3 +375,207 @@ the pin, is the durable state; nothing was committed to the SDK tree itself.
 `tools/setup_sdk_src.cmd` now applies the new patch after the FSR one, with the
 same "only if it applies cleanly" guard.
 
+§9 adds a **ninth** modified file (`src/ui/rex_app.cpp`, the exit-reason probe),
+captured as `thirdparty/rexglue-sdk-guest-exit-status-probe.patch` — see §9.3.
+
+## 9. Exit-status pass (kanban `t_42fc19a7`) — the guest does not quit; the host faults
+
+### 9.1 What this pass changed about the question
+
+The card's premise (and §7's) was that the guest main thread *returns* and nobody
+knows why. **That is not what happens.** With the guest-exit probe in place and
+`WINEDEBUG=+seh`, the failure is a hard **`EXCEPTION_ACCESS_VIOLATION`
+(0xC0000005)** inside `rexruntime.dll`. The process does not shut down, does not
+return an exit code from the guest, and never reaches `Execution complete` —
+Wine kills it, and the lane records **exit code 5** (which is exactly what every
+"self-exit" in §5/§7 was: a crash, not a quit).
+
+So the earlier wording — "the guest exits itself for an unknown reason" — was
+the wrong frame. There is no guest exit to explain; there is a crash to fix.
+
+### 9.2 The crash, exactly
+
+From `WINEDEBUG=+seh` on three separate armed launches (`fable_2_040/044/045`,
+logs kept, raw trace beside them):
+
+```
+code=c0000005 (EXCEPTION_ACCESS_VIOLATION) flags=0
+info[0]=0000000000000000        ; read (not write)
+info[1]=FFFFFFFFFFFFFFFF        ; faulting address = -1, i.e. a NULL base + offset
+rip=00006ffffc5bc690            ; rexruntime.dll + 0xEC690
+rsp=000000000010f620 rbp=000000000010f6e0   ; identical in all three runs
+```
+
+The module base changes per run (ASLR), the **RVA does not**: `+0xEC690` in all
+three traces, with an identical `rsp`/`rbp`, i.e. the same call path at the same
+depth. This is a deterministic site, not a race window.
+
+The faulting instruction (disassembled from the armed DLL) is
+
+```
+1800ec68c:  movq 0x10(%rcx), %r8
+1800ec690:  cmpb $0x0, 0x19(%r8)      <-- fault
+```
+
+`0x19` is the MSVC `std::_Tree_node` **isnil** byte (colour at `+0x18`, nil at
+`+0x19`); the code is walking a red-black tree (`std::map`/`multimap`) and
+dereferences a node pointer taken from a node that is no longer a live tree
+entry — the classic shape of an **iterator/nodes invalidated under the
+iterator**, i.e. the walk is reading the nil flag through a null/garbage node.
+Registers just before the fault (`rcx=0x2d8211`, `rdx=0x2d8211`, `r8` derived
+from `rcx+0x10`) show the walk had already moved inside the tree.
+
+Where: `.pdata` puts the containing function at `0xEC650..0xEC751` (257 B, fault
+at `+0x40`). The DLL carries no COFF symbols and was built without `/DEBUG`, so
+there is no PDB to name it exactly; the nearest **export** below it is
+`rex::ui::Presenter::RefreshGuestOutput` (`0xEA160`), and the frame sits `0x4F0`
+into that region — a nested/out-of-line helper of the presenter's refresh path.
+The unwind chain (`+0xEC690` → `+0x119867` → `+0xE9D5B` → `+0xF5391` →
+`+0xFF111` → `+0xFEE97` → two `fable_2.exe` frames) ends in
+**`SDLWindowedAppContext::RunMainMessageLoop`** (`0xFEE50..0xFEF8B`,
+`0xFEFC0..0xFF458`): the fault is on the **UI/present thread**, not on the guest
+module thread.
+
+The presenter stores the iterator state in the object at `this+0x1e8` with a flag
+at `this+0x1f0` — the shape of a **saved iterator + has-value pair**. The only
+`std::multimap` in `Presenter` is `ui_drawers_`, and it is driven exactly that
+way: `AddUIDrawer`/`RemoveUIDrawers` (`src/ui/presenter.cpp:735-780`) keep
+`ui_draw_next_iterator_` alive across a draw execution and `erase()` other nodes
+while it is held. That is the strongest candidate for the node the walk reads,
+and it is testable (erase-during-walk assertion / copy the iterator list at walk
+start). It is a **candidate named by the machine code shape + the only matching
+container**, not yet proven by a bisect of its own.
+
+### 9.3 The exit-status probe itself (test 1), and why it returned nothing
+
+The probe was implemented as the card asked — `guest_object<X_KTHREAD>()`'s
+`exit_status` / `last_error` at `OnGuestThreadExit`, in the module-thread lambda
+of `src/ui/rex_app.cpp` (compiled by the **game** exe; `win-amd64/share/rexglue/
+rex_app.cpp` is the copy the game build actually compiles, so both were edited).
+It is a **game** rebuild, as §7 predicted; the game exe is
+`out/build/wincross-release-v2r/fable_2.exe` (md5 `4b6dfc55…`, plain pre-probe
+exe kept at `out/exe-plain/fable_2.exe`, md5 `558e7a9a…`).
+
+Three attempts were needed and each one taught something the doc should keep:
+
+1. `guest_object<X_KTHREAD>()` **does not link** from a consumer exe — the
+   `XObject::memory()` accessor it calls inline is not exported from
+   `rexruntime.dll`. Read the struct through
+   `runtime_->kernel_state()->memory()->TranslateVirtual<...>(...)` instead.
+2. The probe wrote to the **log sink first**, and its lines vanished: in 2 of 12
+   armed runs the log recorded the module thread's return (`guest module thread
+   returned (exit probe reached)`, `fable_2_037/038`) and then the log simply
+   **stops** — the process dies with the logger's buffer unflushed. So the probe
+   was rebuilt to append to `probe-exit.txt` with `fopen`/`fprintf`/`fclose`
+   (unbuffered per line) *and* to the log.
+3. With that build, **`probe-exit.txt` is never created in any run**: the
+   module-thread continuation does not run at all in the decisive cases, because
+   the UI thread's access violation kills the process while the guest thread is
+   still parked. This is the one-line answer to the card's test 1: **the exit
+   status cannot be obtained, because there is no exit — the process is destroyed
+   by a crash on another thread.** (In the two runs where the continuation *did*
+   run, the crash still followed within the same second, before the file write;
+   the file probe was not reached even then.)
+
+The probe stays in the tree, captured as a new tracked patch, because it is the
+only instrument that can tell "guest returned" from "process crashed" in future
+runs — and it is inert: 38 inserted lines, all inside the module-thread lambda,
+run once per launch at most.
+
+### 9.4 This pass's launches (rates, not single runs)
+
+Same layout and lane as §7 (`game-job.sh`, operator default DP-1, window placed
+never activated, audio muted), bilinear probe, 75 s survival bar
+(`/usr/bin/timeout -k 15 75`), `--gpu-wait 0` so the advisory gate cannot stall a
+batch. Logs `out/launchcheck/logs/fable_2_0NN.log` (035–050), ledger
+`~/.hermes/logs/game-jobs.jsonl`. Free VRAM was 3.8–4.6 GB throughout (the
+resident `qwen3-tts` server holds ~4.9 GB); the same pressure sat on every arm
+including the controls, and no other game or job held the lane at any point.
+
+| # | arm | runs | outcome | time alive after 1st paint | last-second `WAIT_REG_MEM` |
+|---|---|---|---|---|---|
+| 035 | control: prebuilt 0.10.0 DLLs (before the batches) | 1 | survived 75.6 s | — | 319/s |
+| 036 | armed + probe r1 | 1 | crash (rc 5) | 53.5 s | 911/s |
+| 037 | armed + probe r2 | 1 | crash (rc 5), module thread returned first | 28.5 s | 910/s |
+| 038 | armed + probe r3 | 1 | crash (rc 5), module thread returned first | 7.1 s | 189/s |
+| 039 | armed + probe r4 | 1 | crash (rc 5) | 12.4 s | 199/s |
+| 040 | armed + probe r5, `+seh` | 1 | crash (rc 5), **RIP +0xEC690** | 9.9 s | 201/s |
+| 041 | armed + probe A1 | 1 | crash (rc 5) | 1.3 s | — |
+| 042 | armed + probe A2 | 1 | **survived 75.8 s** | — | 290/s |
+| 043 | armed + probe A3 | 1 | crash (rc 5) | 1.3 s | — |
+| 044 | armed + probe, `+seh` (1) | 1 | crash (rc 5), **RIP +0xEC690** | 1.7 s | — |
+| 045 | armed + probe, `+seh` (2) | 1 | crash (rc 5), **RIP +0xEC690** | 16.9 s | 187/s |
+| 046 | **test 3a**: `present_dither=1` | 1 | crash (rc 5) | 8.7 s | 207/s |
+| 047 | **test 3a**: `present_dither=1` | 1 | crash (rc 5) | 23.7 s | 903/s |
+| 048 | FSR re-verify (`present_effect=fsr`, dumps) | 1 | **survived 76.8 s** | — | 269/s |
+| 049 | control: prebuilt DLLs (closing bracket) | 1 | survived 75.6 s | — | 292/s |
+| 050 | control: option-OFF source build (closing bracket) | 1 | survived 75.6 s | — | 640/s |
+
+**Rates.** Armed bilinear (036–041, 043, 044–047): **11 crashes in 12 launches**;
+one survivor (042). Controls in this session **3 launches, 3 survivals, 0
+crashes** (035, 049 prebuilt; 050 option-OFF), and with §7's four and §5's one
+the control tally is **8 survivals in 8 control launches**. This reproduces §7's
+9/10 armed versus 0/8 control with the failure now *identified* rather than
+merely counted.
+
+Two details worth keeping:
+
+- the crash time after first paint is far wider than §7 recorded — 1.3 s to
+  53.5 s, with two launches dying **on the first presented frame** (041, 043) and
+  two before a single `WAIT_REG_MEM` counter tick — so "~30-40 s" was a sampling
+  artefact of short batches;
+- the last-second `WAIT_REG_MEM` is confirmed *again* as uninformative: crashes
+  ended at 187–911/s and a **surviving control ended at 640/s** (050), the
+  highest rate of any run in this session that did not crash.
+
+### 9.5 Test 3a (present timing) and tests 2/3b that were not reached
+
+- **Test 3a, `present_dither=1` — rate flat.** 2 launches, 2 crashes, and the
+  chain line changes as expected (`1 pass(es): #0 bilinear-dither -> 2560x1440`
+  in both). An extra shader branch in the present path moves nothing. **Sample
+  size 2 — this is direction, not a rate**; the baseline is 11/12, so 2/2 is what
+  the baseline predicts and no more.
+- **Test 2 (zero-length DXIL blobs) — NOT RUN.** It needs a fresh
+  `rexruntime.dll` build (~4 min) plus ≥5 launches, and the human gate on this box
+  expires 2026-11-04 15:35 (it is not renewable by an agent). Running three
+  launches instead of five would have produced a number the card explicitly
+  refuses to accept, so it was left to the next pass with the gate time intact.
+- **Test 3b (different swap-chain size) — NOT RUN**, same reason.
+
+Note that test 2's premise has also weakened: it was designed to test whether
+*image size/layout* changes the rate of a **guest exit**. The exit is now known to
+be a deterministic fault in presenter refresh code, so image size is a much less
+promising lever than "does the crash survive at all without the FidelityFX-gated
+presenter" — which §5's controls already answer (it does not).
+
+### 9.6 FSR re-verified (no SDK rebuild this pass)
+
+No SDK rebuild was needed for anything in §9 except the game exe, so the armed
+runtime in use is **byte-identical** to §7.1's (`out/fsr-clean/rexruntime.dll`,
+md5 `13a5d065…`). It was re-verified anyway, on the probe exe, launch 048:
+chain logged `2 pass(es): #0 fsr-easu -> 2560x1440 #1 fsr-rcas -> 2560x1440`,
+**10 dumps** written at 3440x1440 (`out/upscale-dumps/verify-fsr2/
+present-final-0{3000,7000,…}.ppm`, paints 300–3900 every 400), and the run then
+**survived the full 76.8 s bar**. Every bilinear arm in §9.4 logged
+`1 pass(es): #0 bilinear -> 2560x1440` or `#0 bilinear-dither` in the same
+breath, so the presenter chain is live in every arm that crashed as well.
+
+### 9.7 Recommendation (one line, for Marcus)
+
+**Do not ship the armed build as it stands:** it crashes 11 times in 12 launches
+at a deterministic `rexruntime.dll+0xEC690` fault, so keep it on the branch but
+revert it from anything the operator runs, until the `ui_drawers_`-shaped
+iterator walk in the presenter refresh path is fixed or disproved.
+
+### 9.8 Artefacts from this pass
+
+- `thirdparty/rexglue-sdk-guest-exit-status-probe.patch` — the exit-reason
+  probe (38 lines, `src/ui/rex_app.cpp`), the ninth modified SDK file; §8's pair
+  still reproduces the other eight unchanged.
+- `out/exe-plain/fable_2.exe` — the pre-probe game exe (md5 `558e7a9a…`), kept so
+  the plain build can be staged again.
+- `out/upscale-dumps/verify-fsr2/` — the §9.6 dump pair.
+- `out/launchcheck/logs/fable_2_0{35..50}.log` and `out/launchcheck/last-run.out`
+  (the `+seh` trace of the last instrumented run) — the per-run evidence.
+
+

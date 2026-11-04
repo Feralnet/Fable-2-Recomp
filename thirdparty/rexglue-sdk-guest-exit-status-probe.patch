@@ -1,0 +1,56 @@
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index c91c4ee..37af920 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/rex_app.h>
+ 
++#include <cstdio>
+ #include <cstdlib>
+ #include <functional>
+ #include <string>
+@@ -497,6 +498,43 @@ void ReXApp::LaunchModule() {
+ 
+     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+       main_thread->Wait(0, 0, 0, nullptr);
++      // Exit-reason probe. Written to a file, not the log sink: a hard process
++      // exit (std::_Exit / ExitProcess from a guest thread) drops whatever the
++      // logger still has buffered, so a REXLOG line can vanish at exactly the
++      // moment it matters. fopen/fprintf/fclose per line survives that.
++      auto probe_write = [](const char* text) {
++        if (FILE* f = ::fopen("probe-exit.txt", "a")) {
++          std::fprintf(f, "%s\n", text);
++          std::fclose(f);
++        }
++        REXLOG_INFO("{}", text);
++      };
++      char line[256];
++      probe_write("guest module thread returned (exit probe reached)");
++      system::X_KTHREAD* kthread = nullptr;
++      auto* ks = runtime_ ? runtime_->kernel_state() : nullptr;
++      auto* mem = ks ? ks->memory() : nullptr;
++      uint32_t kthread_guest = main_thread->guest_object();
++      std::snprintf(line, sizeof(line), "probe: runtime=%p kernel_state=%p memory=%p kthread_guest=0x%08X",
++                    static_cast<void*>(runtime_.get()), static_cast<void*>(ks), static_cast<void*>(mem),
++                    kthread_guest);
++      probe_write(line);
++      if (mem && kthread_guest) {
++        kthread = mem->TranslateVirtual<system::X_KTHREAD*>(kthread_guest);
++      }
++      if (kthread) {
++        std::snprintf(line, sizeof(line),
++                      "guest module thread exit: exit_status=0x%08X last_error=0x%08X "
++                      "terminated=%u start_address=0x%08X thread_id=%u",
++                      static_cast<uint32_t>(kthread->exit_status),
++                      static_cast<uint32_t>(kthread->last_error),
++                      static_cast<uint32_t>(kthread->terminated),
++                      static_cast<uint32_t>(kthread->start_address),
++                      static_cast<uint32_t>(kthread->thread_id));
++        probe_write(line);
++      } else {
++        probe_write("guest module thread exit: no guest X_KTHREAD (object already released)");
++      }
+       OnGuestThreadExit(main_thread.get());
+       REXLOG_INFO("Execution complete");
+       if (!shutting_down_.load(std::memory_order_acquire)) {
