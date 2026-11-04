@@ -1,0 +1,365 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..bd71151 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,14 @@ project(ReXGlue
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
++# Enables the *raster* FidelityFX effects of the guest output painter (FSR 1
++# EASU + RCAS, CAS) without pulling the whole AMD FidelityFX SDK. Those effects
++# are plain pixel shaders whose DXIL bytecode is vendored in
++# src/ui/shaders/bytecode/d3d12_5_1/ (guest_output_ffx_*), so all they need is
++# the REX_HAS_FIDELITYFX_SDK compile definition. The temporal FSR2/FSR3 path
++# (REX_HAS_FIDELITYFX_RUNTIME, ffx_api headers, vendored FidelityFX runtime) is
++# NOT enabled by this option and stays compiled out.
++option(REXGLUE_ENABLE_FSR1_RASTER "Enable the raster FidelityFX guest output effects (FSR 1, CAS) without the FidelityFX SDK" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+ # Propagate profiling defines globally (compiled out in Release)
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 83d09f7..c954b47 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -105,6 +105,11 @@ class D3D12Presenter final : public Presenter {
+   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+ 
+  private:
++  // Short name of a guest output paint effect ("bilinear", "fsr-easu", ...) for
++  // the effect-chain log line and the present_dump_final file names. A member
++  // function because GuestOutputPaintEffect is protected in Presenter.
++  static const char* GuestOutputPaintEffectName(GuestOutputPaintEffect effect);
++
+   struct GuestOutputPaintRectangleConstants {
+     union {
+       struct {
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..ac2140e 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -124,6 +124,17 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
+     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+ endif()
+ 
++# Raster-only FidelityFX path: the FSR 1 EASU / RCAS and CAS guest output
++# effects are precompiled pixel shaders (DXIL blobs in
++# src/ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_*), they include no
++# ffx_api / FidelityFX SDK headers, so REX_HAS_FIDELITYFX_SDK alone turns the
++# present_effect=cas|fsr cvars and the effect chain on. The temporal FSR2/FSR3
++# runtime (REX_HAS_FIDELITYFX_RUNTIME) remains off unless the vendored
++# FidelityFX runtime targets exist.
++if(REXGLUE_ENABLE_FSR1_RASTER)
++    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
++endif()
++
+ set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
+ if(TARGET amd_fidelityfx_vk)
+     target_link_libraries(rexui PRIVATE amd_fidelityfx_vk)
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 603fca3..6b94b13 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -12,7 +12,12 @@
+ #include <algorithm>
+ #include <climits>
+ #include <cmath>
++#include <cstdio>
++#include <cstdint>
++#include <filesystem>
+ #include <memory>
++#include <string>
++#include <system_error>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -33,8 +38,151 @@
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
+ 
++// ---------------------------------------------------------------------------
++// Final-image dump (upscaling spike diagnostic).
++//
++// Writes the swap chain back buffer AFTER the guest output effect chain has
++// composited into it - bilinear, CAS or FSR (EASU + RCAS) - i.e. exactly the
++// pixels handed to Present. CaptureGuestOutput deliberately reads the *guest*
++// texture before any host-side scaling, so it cannot answer "did the upscaler
++// run"; this dump can: run the same scene once with present_effect=bilinear
++// and once with present_effect=fsr, dump the same paint index in both runs, and
++// compare the images (they must differ, and the FSR one must be the same size
++// as the bilinear one with sharper edges).
++//
++//   present_dump_final        directory to write into (empty = disabled)
++//   present_dump_final_start  first paint index to dump (default 60)
++//   present_dump_final_count  how many paints to dump from there (default 3)
++//
++// Files are binary PPM (P6): <dir>/present-final-<paint>-<W>x<H>-<chain>.ppm
++// ---------------------------------------------------------------------------
++REXCVAR_DEFINE_STRING(present_dump_final, "", "UI/Presenter",
++                      "Directory for post-effect final frame dumps (empty = off)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(present_dump_final_start, 60, "UI/Presenter",
++                     "First paint index dumped by present_dump_final")
++    .range(0, 1000000)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(present_dump_final_count, 3, "UI/Presenter",
++                     "Number of paints dumped by present_dump_final")
++    .range(1, 1000)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(present_dump_final_every, 0, "UI/Presenter",
++                     "Dump one paint every N paints after present_dump_final_start (0 = every paint)")
++    .range(0, 1000000)
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::ui::d3d12 {
+ 
++namespace {
++
++// Human-readable description of the guest output effect chain built most
++// recently, used in the present_dump_final file name so a dump says which
++// upscaler produced it (for example "bilinear" or "fsr-easu+fsr-rcas").
++std::string g_last_guest_output_flow_description = "unknown";
++
++}  // namespace
++
++const char* D3D12Presenter::GuestOutputPaintEffectName(GuestOutputPaintEffect effect) {
++  switch (effect) {
++    case Presenter::GuestOutputPaintEffect::kBilinear:
++      return "bilinear";
++    case Presenter::GuestOutputPaintEffect::kBilinearDither:
++      return "bilinear-dither";
++#if defined(REX_HAS_FIDELITYFX_SDK)
++    case Presenter::GuestOutputPaintEffect::kCasSharpen:
++      return "cas-sharpen";
++    case Presenter::GuestOutputPaintEffect::kCasSharpenDither:
++      return "cas-sharpen-dither";
++    case Presenter::GuestOutputPaintEffect::kCasResample:
++      return "cas-resample";
++    case Presenter::GuestOutputPaintEffect::kCasResampleDither:
++      return "cas-resample-dither";
++    case Presenter::GuestOutputPaintEffect::kFsrEasu:
++      return "fsr-easu";
++    case Presenter::GuestOutputPaintEffect::kFsrRcas:
++      return "fsr-rcas";
++    case Presenter::GuestOutputPaintEffect::kFsrRcasDither:
++      return "fsr-rcas-dither";
++#endif
++    default:
++      return "effect";
++  }
++}
++
++// Decides whether the current paint should be dumped (present_dump_final) and
++// builds the output file name. Called once per paint; the paint index advances
++// on every call.
++bool PlanFinalDump(uint32_t width, uint32_t height, std::string* path_out) {
++  static bool resolved = false;
++  static std::string dump_dir;
++  static int32_t start_index = 60;
++  static int32_t max_count = 3;
++  static int32_t every = 0;
++  static int64_t paint_index = -1;
++  static int32_t dumped_count = 0;
++  if (!resolved) {
++    resolved = true;
++    dump_dir = REXCVAR_GET(present_dump_final);
++    start_index = REXCVAR_GET(present_dump_final_start);
++    max_count = REXCVAR_GET(present_dump_final_count);
++    every = REXCVAR_GET(present_dump_final_every);
++    if (!dump_dir.empty()) {
++      std::error_code mkdir_error;
++      std::filesystem::create_directories(dump_dir, mkdir_error);
++      REXLOG_INFO("present dump: writing post-effect frames to {} from paint {} (every {})",
++                  dump_dir, start_index, every);
++    }
++  }
++  ++paint_index;
++  if (dump_dir.empty() || dumped_count >= max_count || paint_index < int64_t(start_index)) {
++    return false;
++  }
++  if (every > 0 && (paint_index - int64_t(start_index)) % int64_t(every) != 0) {
++    return false;
++  }
++  ++dumped_count;
++  char name[256];
++  snprintf(name, sizeof(name), "present-final-%05lld-%ux%u-%s.ppm", (long long)paint_index, width,
++           height, g_last_guest_output_flow_description.c_str());
++  *path_out = (std::filesystem::path(dump_dir) / name).string();
++  return true;
++}
++
++// Writes a binary PPM (P6) from a mapped B8G8R8A8 readback buffer.
++void WriteFinalDumpPpm(const void* mapped, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& layout,
++                       UINT rows, uint32_t width, uint32_t height, const std::string& path) {
++  FILE* file = fopen(path.c_str(), "wb");
++  if (!file) {
++    REXLOG_ERROR("present dump: cannot open {}", path);
++    return;
++  }
++  fprintf(file, "P6\n%u %u\n255\n", width, height);
++  const uint8_t* base = static_cast<const uint8_t*>(mapped);
++  const uint32_t pixel_bytes = layout.Footprint.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? 4 : 4;
++  for (uint32_t y = 0; y < height; ++y) {
++    if (y >= rows) {
++      break;
++    }
++    const uint8_t* row = base + size_t(y) * layout.Footprint.RowPitch;
++    for (uint32_t x = 0; x < width; ++x) {
++      const uint8_t* texel = row + size_t(x) * pixel_bytes;
++      uint8_t rgb[3];
++      if (layout.Footprint.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
++        rgb[0] = texel[0];
++        rgb[1] = texel[1];
++        rgb[2] = texel[2];
++      } else {
++        rgb[0] = texel[2];
++        rgb[1] = texel[1];
++        rgb[2] = texel[0];
++      }
++      fwrite(rgb, 1, 3, file);
++    }
++  }
++  fclose(file);
++}
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
+@@ -623,6 +771,34 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+ 
+     if (guest_output_flow.effect_count) {
++      // Report the chain once per change: which passes the presenter is about
++      // to run and at which sizes. This is the "did the upscale actually get
++      // scheduled" proof in the log, next to the present_dump_final images.
++      {
++        std::string chain_description;
++        std::string chain_detail;
++        for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
++          if (i) {
++            chain_description += '+';
++          }
++          chain_description += GuestOutputPaintEffectName(guest_output_flow.effects[i]);
++          chain_detail += " #";
++          chain_detail += std::to_string(i);
++          chain_detail += ' ';
++          chain_detail += GuestOutputPaintEffectName(guest_output_flow.effects[i]);
++          chain_detail += " -> ";
++          chain_detail += std::to_string(guest_output_flow.effect_output_sizes[i].first);
++          chain_detail += 'x';
++          chain_detail += std::to_string(guest_output_flow.effect_output_sizes[i].second);
++        }
++        if (chain_description != g_last_guest_output_flow_description) {
++          g_last_guest_output_flow_description = chain_description;
++          REXLOG_INFO(
++              "guest output paint: {}x{} -> {}x{}, {} pass(es):{}", guest_output_properties.frontbuffer_width,
++              guest_output_properties.frontbuffer_height, paint_context_.swap_chain_width,
++              paint_context_.swap_chain_height, guest_output_flow.effect_count, chain_detail);
++        }
++      }
+       ID3D12DescriptorHeap* view_heap = paint_context_.view_heap.Get();
+       D3D12_CPU_DESCRIPTOR_HANDLE view_heap_cpu_start =
+           view_heap->GetCPUDescriptorHandleForHeapStart();
+@@ -1129,13 +1305,56 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     ExecuteUIDrawersFromUIThread(ui_draw_context);
+   }
+ 
++  // Optional diagnostic: copy the finished back buffer (guest output effect
++  // chain already applied) to a readback buffer. Written out after the
++  // submission below, once the copy is known to have completed.
++  bool dump_final_this_paint = false;
++  Microsoft::WRL::ComPtr<ID3D12Resource> dump_final_readback;
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT dump_final_layout = {};
++  UINT dump_final_rows = 0;
++  std::string dump_final_path;
++  if (PlanFinalDump(paint_context_.swap_chain_width, paint_context_.swap_chain_height,
++                    &dump_final_path)) {
++    D3D12_RESOURCE_DESC back_buffer_desc = back_buffer->GetDesc();
++    UINT64 dump_total_bytes = 0;
++    device->GetCopyableFootprints(&back_buffer_desc, 0, 1, 0, &dump_final_layout,
++                                  &dump_final_rows, nullptr, &dump_total_bytes);
++    D3D12_RESOURCE_DESC dump_buffer_desc;
++    util::FillBufferResourceDesc(dump_buffer_desc, dump_total_bytes, D3D12_RESOURCE_FLAG_NONE);
++    if (SUCCEEDED(device->CreateCommittedResource(
++            &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &dump_buffer_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dump_final_readback)))) {
++      D3D12_RESOURCE_BARRIER barrier_to_copy_source;
++      barrier_to_copy_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++      barrier_to_copy_source.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++      barrier_to_copy_source.Transition.pResource = back_buffer;
++      barrier_to_copy_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++      barrier_to_copy_source.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++      barrier_to_copy_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++      command_list->ResourceBarrier(1, &barrier_to_copy_source);
++      D3D12_TEXTURE_COPY_LOCATION copy_source;
++      copy_source.pResource = back_buffer;
++      copy_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      copy_source.SubresourceIndex = 0;
++      D3D12_TEXTURE_COPY_LOCATION copy_dest;
++      copy_dest.pResource = dump_final_readback.Get();
++      copy_dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++      copy_dest.PlacedFootprint = dump_final_layout;
++      command_list->CopyTextureRegion(&copy_dest, 0, 0, 0, &copy_source, nullptr);
++      dump_final_this_paint = true;
++    } else {
++      REXLOG_ERROR("present dump: failed to create the readback buffer");
++    }
++  }
++
+   // End drawing to the back buffer.
+   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
+   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+   barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+   barrier_rtv_to_present.Transition.pResource = back_buffer;
+   barrier_rtv_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-  barrier_rtv_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++  barrier_rtv_to_present.Transition.StateBefore =
++      dump_final_this_paint ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+ 
+@@ -1143,6 +1362,45 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   command_list->Close();
+   ID3D12CommandList* execute_command_list = command_list;
+   provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
++
++  if (dump_final_this_paint && dump_final_readback) {
++    // Wait for the copy (queued with the paint command list) to complete on the
++    // GPU, then write the image out. Blocking the UI thread for a handful of
++    // frames is acceptable for a diagnostic.
++    static Microsoft::WRL::ComPtr<ID3D12Fence> dump_final_fence;
++    static HANDLE dump_final_fence_event = nullptr;
++    static UINT64 dump_final_fence_value = 0;
++    if (!dump_final_fence) {
++      if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&dump_final_fence)))) {
++        REXLOG_ERROR("present dump: failed to create the completion fence");
++        dump_final_readback = nullptr;
++      } else {
++        dump_final_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++      }
++    }
++    if (dump_final_readback && dump_final_fence) {
++      ++dump_final_fence_value;
++      provider_.GetDirectQueue()->Signal(dump_final_fence.Get(), dump_final_fence_value);
++      if (dump_final_fence->GetCompletedValue() < dump_final_fence_value) {
++        dump_final_fence->SetEventOnCompletion(dump_final_fence_value, dump_final_fence_event);
++        WaitForSingleObject(dump_final_fence_event, 5000);
++      }
++      D3D12_RANGE dump_read_range;
++      dump_read_range.Begin = 0;
++      dump_read_range.End = SIZE_T(dump_final_layout.Footprint.RowPitch) * dump_final_rows;
++      void* dump_mapped = nullptr;
++      if (SUCCEEDED(dump_final_readback->Map(0, &dump_read_range, &dump_mapped)) && dump_mapped) {
++        WriteFinalDumpPpm(dump_mapped, dump_final_layout, dump_final_rows,
++                          paint_context_.swap_chain_width, paint_context_.swap_chain_height,
++                          dump_final_path);
++        dump_final_readback->Unmap(0, nullptr);
++        REXLOG_INFO("present dump: wrote {} ({}x{}, chain {})", dump_final_path,
++                    paint_context_.swap_chain_width, paint_context_.swap_chain_height,
++                    g_last_guest_output_flow_description);
++      }
++    }
++  }
++
+   if (execute_ui_drawers) {
+     ui_submission_tracker_.NextSubmission();
+   }
