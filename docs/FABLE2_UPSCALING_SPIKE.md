@@ -75,6 +75,11 @@ cmake --build /home/feral/toolchains/rexglue-sdk/build --target rexgpu-xenos rex
 ```
 
 The game itself needs no rebuild — the presenter lives in the runtime DLL.
+`tools/setup_sdk_src.cmd` now applies `thirdparty/rexglue-sdk-fsr1-raster.patch`
+after the existing local patch (skipped, with a note, if it does not apply to
+the pinned SDK). `tools/build_runtime_sdk.cmd` hard-codes
+`-DREXGLUE_ENABLE_FIDELITYFX=OFF`; add `-DREXGLUE_ENABLE_FSR1_RASTER=ON` to its
+cmake line (or configure by hand as above) to get the upscaling runtime.
 
 Run (the launch layout is `out/launchcheck/`, staged by the game's own build):
 

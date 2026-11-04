@@ -20,6 +20,7 @@ setlocal
 set "REPO=%~dp0.."
 set "SRC=%REPO%\thirdparty\rexglue-sdk-src"
 set "PATCH=%REPO%\thirdparty\rexglue-sdk-local.patch"
+set "PATCH_FSR1=%REPO%\thirdparty\rexglue-sdk-fsr1-raster.patch"
 set "PINS=%REPO%\thirdparty\rexglue-sdk-submodule-pins.txt"
 set "PIN_COMMIT=f5337cdc947ff6d4c4196737e2c807a48f2a1fc2"
 
@@ -85,6 +86,22 @@ if errorlevel 1 (
     echo Error: applying local SDK patch failed. 1>&2
     popd
     exit /b 1
+)
+rem Optional second patch: the gated FSR 1 raster present pass (see
+rem docs/FABLE2_UPSCALING_SPIKE.md). Applied only when present, and only when it
+rem applies cleanly, so an older pinned SDK does not block the clone.
+if exist "%PATCH_FSR1%" (
+    git apply --check "%PATCH_FSR1%" >nul 2>&1
+    if errorlevel 1 (
+        echo Note: %PATCH_FSR1% does not apply to this SDK pin - skipping.
+    ) else (
+        git apply "%PATCH_FSR1%"
+        if errorlevel 1 (
+            echo Error: applying the FSR 1 raster SDK patch failed. 1>&2
+            popd
+            exit /b 1
+        )
+    )
 )
 popd
 
