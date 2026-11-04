@@ -862,3 +862,279 @@ without the operator running it.
 - **Zero launches this pass.** Ledger `~/.hermes/logs/game-jobs.jsonl` has no
   entry from it; the only lane activity was `game-job.sh --status` (read-only,
   no allow needed).
+
+**Superseded:** §10.3 (instrument unmeasured), §10.5 (the C1-C4 ranking),
+§10.6 (fix shape unmeasured) and §10.7 (the blocked batch) are all answered by
+**§11** — the measurements were run, and the cause turned out to be C2.
+
+## 11. The same card, measured (kanban `t_683bb4e2`, second pass) — the erase hypothesis is refuted, the cause is named, and it is a cross-module layout collision
+
+**Bottom line: `ui_draw_next_iterator_` is not invalidated by an erase — it is
+overwritten, one byte per emulated vblank, by an inline method in the GPU plugin
+that was compiled against the *option-OFF* layout of `Presenter`. The armed build
+puts `ui_draw_next_iterator_` at `+0x1E8`; the plugin's `OnGuestVblank()` writes
+`guest_vblank_count_` at `+0x1E8`. That is §10.4's "latent trap with no known
+consumer" — it has a consumer, and it fires every vblank.**
+
+24 launches through the lane, rates against a bracketing control: the armed build
+crashed **6 of 6** times it ran without mitigation; every mitigated or option-OFF
+arm survived **18 of 18** (§11.4).
+
+### 11.1 What §10 could not see
+
+§10 reasoned from the *container*: only `AddUIDrawerFromUIThread` and
+`RemoveUIDrawerFromUIThread` can mutate `ui_drawers_`, both already advance the
+iterator when they erase the node it names, therefore a single-threaded
+invalidation "cannot happen" (§10.2) and the remainder had to be cross-thread
+mutation (C1) or corruption (C3). It then ranked the `+0x10` layout delta (C2)
+below both, on the grounds that "today's evidence says no consumer exists".
+
+The measurement says otherwise, on both points:
+
+- **No erase ever runs.** Across the seven instrumented armed launches
+  (`detect-3/6/9/11/13/16/19`), **0** `Add-erase`, **0** `Remove-erase` and **0**
+  `Add-insert-in-walk` events in **89,878 walks**. The erase guards §10.2 analysed
+  are never even reached — the drawer list holds exactly one drawer from first
+  frame to last and is never touched again after startup. So the guards are not
+  the story, and neither is `RemoveUIDrawers`.
+- **The corruption is structured, not random.** It lands on the same byte, in the
+  same object, every time: `this+0x1E8`, +1 per hit. That is a layout collision,
+  not a race on a container or an arbitrary overrun.
+
+### 11.2 The cause, proven three ways
+
+**(a) Source.** `include/rex/ui/presenter.h:195-201`:
+
+```cpp
+// called from the GPU VSync thread. Defined inline (not in presenter.cpp) so
+// the GPU plugin - which holds the Presenter but does not link the rexui
+// object library (symbols come via the curated rexruntime export table) - can
+// call it without needing an exported symbol.
+inline void OnGuestVblank() {
+  guest_vblank_count_.fetch_add(1, std::memory_order_relaxed);
+}
+```
+
+It is inline *by design*, precisely so a target outside `rexui` can call it. That
+is the trap: an inline accessor bakes `offsetof(Presenter, guest_vblank_count_)`
+into the **caller's** translation unit. The caller is
+`src/graphics/graphics_system.cpp:339` (`presenter_->OnGuestVblank();`), which
+belongs to target `rexgpu-xenos` (`src/graphics/CMakeLists.txt:19`), while
+`REX_HAS_FIDELITYFX_SDK` is `target_compile_definitions(rexui PRIVATE ...)`
+(`src/ui/CMakeLists.txt:124`, `:135`). So:
+
+| member | `rexruntime` (armed, define ON) | `rexgpu-xenos` (define never applied) |
+|---|---|---|
+| `is_executing_ui_drawers_` (4 bools) | `0x1F0..0x1F3` | `0x1E0..0x1E3` |
+| `guest_vblank_count_` (`atomic<uint64_t>`) | `0x1F8` | **`0x1E8`** |
+| `ui_draw_next_iterator_` | **`0x1E8`** | `0x1D8` |
+
+A `fetch_add(1)` compiled into the plugin therefore writes to `+0x1E8` — the low
+byte of the armed DLL's saved drawer iterator.
+
+**(b) Object code.** The plugin's own object file carries the write:
+
+```
+build/src/graphics/CMakeFiles/rexgpu-xenos.dir/graphics_system.cpp.obj
+  incq 0x1e8(%rax)          # == OnGuestVblank(), option-OFF offsets
+```
+
+and the same instruction is in the shipped plugin
+(`rexgpu-xenos.dll` +`0xD378`, +`0xE7DF`). In `rexruntime.dll` every access to
+`+0x1E8` inside the presenter region is an 8-byte iterator move — the DLL never
+writes a small value there. The two modules disagree about the same class.
+
+**(c) Runtime.** A hexdump of 32 bytes at the *real* offset of the iterator
+(computed as `&ui_draw_next_iterator_ - this`, so nothing is hardcoded), taken
+immediately before and after `Draw()` (`REX_UI_DRAWERS_DETECT` on, launch 19):
+
+```
+walk 503 pre-draw  +488: 40 4d 2d 00 00 00 00 00 01 01 00 00 ...
+walk 503 post-draw +488: 41 4d 2d 00 00 00 00 00 01 01 00 01 ...
+DEAD ITERATOR walk 503: next node 00000000002D4D61 ... end=00000000002D4D60
+```
+
+`+488` is `0x1E8`. During one `Draw()`: byte 0 (`0x1E8`, the iterator's low byte)
+goes `0x40 -> 0x41`, and byte 11 (`0x1F3`, `request_ui_paint_after_current_ui_
+thread_paint_`) goes `0 -> 1`. The first is the plugin's vblank increment landing
+on the iterator; the second is presenter.cpp's own honest write, at the *correct*
+armed offset. Byte 24 (`0x200`, `guest_frame_count_` in the armed layout) is
+untouched — and, as a consequence of the same collision, the armed build's
+`guest_vblank_count_` at `0x1F8` is never incremented at all (not directly
+observed: the pacer diagnostic that prints it does not fire under this config).
+
+The fatal consequence, from the `+seh` launch 24 (armed baseline, no mitigation):
+
+```
+code=c0000005 (EXCEPTION_ACCESS_VIOLATION) addr=00006FFFFCAFC690
+ info[0]=0000000000000000   info[1]=FFFFFFFFFFFFFFFF
+ rip=00006ffffcafc690 rsp=... rbp=...
+ r8=0100000000161df0
+ rexruntime.dll + 0xEC690
+```
+
+`0x6FFFFCAFC690` is `+0xEC690` exactly as §9 recorded, `info[0]=0` (read) and
+`info[1]=-1`. `r8 = 0x0100000000161df0`: the top byte of a node pointer has been
+overwritten with `0x01` — the same one-byte corruption, on a different pointer
+inside the same tree walk. `cmpb $0x0,0x19(%r8)` then reads unmapped memory.
+
+### 11.3 The card's hypothesis: refuted
+
+The card asks whether the walk "dereferences a node that `RemoveUIDrawers` erased
+while `ui_draw_next_iterator_` was still holding it". **No.**
+
+- `RemoveUIDrawerFromUIThread` and `AddUIDrawerFromUIThread` are never called:
+  0 erases, 0 inserts, in 89,878 armed walks (§11.1).
+- The iterator's *node* is never freed. What changes is its *low byte*, by an
+  increment from another module, at a fixed offset.
+- The erase guards at `presenter.cpp:750`/`:775` are correct for the case they
+  cover, and §10.2's reading of them stands. They simply never run here.
+
+What survives from the hypothesis is the weaker, structural half: **the walk is
+the crash site because it dereferences a stored iterator that nothing revalidates
+across `Draw()`.** Detection + resync and the fix shape both remove the crash
+(§11.4/§11.6). But the thing that makes the iterator wrong is not an erase, and a
+fix placed in the drawer list cannot remove it.
+
+### 11.4 Rates (24 launches, this session, same lane)
+
+Lane `game-job.sh` (operator default DP-1, window placed never activated, audio
+muted), `--timeout 130 --gpu-wait 0`, inner bar `/usr/bin/timeout -k 15 75`,
+`REX_PRESENT_EFFECT=bilinear`, interleaved so drift cannot track arm. Arms:
+**B** = armed build as shipped (`out/fsr-clean`, `13a5d065…`); **D/Z** = armed +
+detector; **F** = armed + fix shape; **C** = option-OFF build (`a27a9a5b…`);
+**O** = option-OFF + detector; **V** = FSR re-verify.
+
+| arm | launches | crashes (rc 5) | survived | detections |
+|---|---|---|---|---|
+| **B** armed baseline | 5 (20-24) | **5** | 0 | — |
+| **V** armed, `present_effect=fsr` | 1 (1) | **1** | 0 | — |
+| **D** armed + detector | 5 (3,6,9,11,13) | **0** | 5 | 10, 8, 10, 6, 14 |
+| **Z** armed + detector + topology | 2 (16,19) | **0** | 2 | 15, 29 |
+| **F** armed + fix shape | 5 (4,7,10,12,14) | **0** | 5 | — |
+| **C** option-OFF control | 4 (2,5,8,15) | **0** | 4 | — |
+| **O** option-OFF + detector | 2 (17,18) | **0** | 2 | **0** |
+
+Totals: **6 crashes in 6 armed-unmitigated launches** (5 bilinear + 1 FSR);
+**0 crashes in 18** mitigated or option-OFF launches. Detector runs caught
+**92** dead-iterator events in 89,878 armed walks; the option-OFF build caught
+**0** in 26,054 walks — the phenomenon is armed-only, which is the direct
+answer to §11.5.
+
+Time alive after first paint for the crashes: **14.1, 20.0, 37.3, 55.7, 64.9 s**
+(bilinear) and 58.7 s (FSR) — reproducing §9.4's 1.3-53.5 s spread and its
+conclusion that the crash is not tied to a fixed point in the run. Surviving arms
+all reached the 72.2-75.1 s bar.
+
+Free VRAM was ~9.0 GB throughout (the resident `qwen3-tts` server was **not**
+loaded this pass, unlike §9's 3.8-4.6 GB). It was equal across every arm and
+control, so it did not confound the comparison — but it means this batch ran
+under lighter GPU pressure than §9's, which is worth knowing when comparing
+absolute crash times. No other game or job held the lane at any point.
+
+### 11.5 Why the option triggers it (deliverable 4, answered)
+
+`REXGLUE_ENABLE_FSR1_RASTER=ON` → `REX_HAS_FIDELITYFX_SDK=1` is applied to
+**`rexui` only** → `rexui`'s `Presenter` grows by `0x10` (four `GuestOutputPaint
+Config` members) → in `rexruntime.dll`, `ui_draw_next_iterator_` sits at `0x1E8`
+→ the GPU plugin, compiled without the define, still writes
+`guest_vblank_count_` at `0x1E8` → every emulated vblank increments the low byte
+of the armed iterator → when that byte is incremented while the iterator is held
+at `end()` across a `Draw()`, the next loop test sees `end+1` instead of `end`,
+enters the body, and `operator++` dereferences `end+1` as a tree node.
+
+It is not the shader/pipeline plumbing, not the extra cvars, and not a timing
+perturbation. It is a data-layout disagreement between two modules about one
+class, made reachable by making the accessor inline.
+
+This also explains §10.5's awkward fact — that the crash fires with
+`present_effect=bilinear`, where no FSR code runs — and it explains why the
+option-OFF build is stable: there, `0x1E8` *is* `guest_vblank_count_`, so the
+write is correct. The two builds differ in whether the plugin's write is
+harmless or destructive, which is exactly the correlation §9 could measure but
+not explain.
+
+### 11.6 The fix shape (deliverable 3) — measured
+
+`REX_UI_DRAWERS_FIX=1` (no iterator held across `Draw()`; the next drawer is
+re-derived from the live map each step): **5 launches, 5 survivals, 0 crashes**
+against a bracketing control of 4 option-OFF survivals and 5 armed-baseline
+crashes. By the card's rule that is rate → ~0, i.e. the arm that removes the held
+iterator removes the crash.
+
+What it does **not** do: it does not stop the corruption. The plugin still writes
+to `+0x1E8` on every vblank; the fix merely guarantees this loop never reads that
+field, so the scribble stops being fatal *here*. Treat it as a workaround with a
+proven symptom-removal rate, not as the repair — other readers of the same
+object are still exposed, and `guest_vblank_count_` is still not incremented in
+the armed build.
+
+### 11.7 The actual repair
+
+The defect is the inline accessor, not the drawer list. In preference order:
+
+1. **Move `OnGuestVblank()` out of line into `presenter.cpp`** and export it
+   (the class's rationale for inlining it was avoiding an export; the curated
+   export table can carry it). This removes all layout knowledge from the plugin
+   and is a one-function change. It also fixes every sibling hazard at once,
+   including the un-incremented `guest_vblank_count_`.
+2. **Stop the layout from shifting**: give `Presenter` the FidelityFX members
+   regardless of the define (unused when off), or put them behind a pointer, so
+   option ON/OFF are layout-identical.
+3. Making the define `PUBLIC`/`INTERFACE` on `rexui` would also align consumers,
+   but it drags FidelityFX headers into every consumer — worse trade.
+
+The blast radius is narrow by construction: `OnGuestVblank` is the only
+member-touching method defined in-class that an external target calls (its own
+comment says so), and it is reachable from one call site. Any future inline
+accessor added to `Presenter` re-opens the same hole.
+
+### 11.8 FSR re-verified (deliverable 6)
+
+The instrumented `rexruntime.dll` is an SDK rebuild, so the rule applied. Launch
+1, `present_effect=fsr`, armed instrumented build: chain logged
+`2 pass(es): #0 fsr-easu -> 2560x1440 #1 fsr-rcas -> 2560x1440`, **10 dumps**
+written at 3440x1440 in `out/upscale-dumps/verify-fsr3/`
+(`present-final-0{0300,0700,…,3900}-3440x1440-fsr-easu+fsr-rcas.ppm`), and the
+run then crashed at 58.7 s — the same armed-only fault, i.e. FSR is running and
+the crash is not FSR-specific. Bilinear arms logged `1 pass(es): #0 bilinear ->
+2560x1440` in the same breath, so the presenter chain is live in every arm.
+
+### 11.9 Recommendation (deliverable 5, for Marcus)
+
+**The armed build still should not go on the operator's install — but the reason
+has changed, and it is now cheap to fix.** It is not an unexplained crash any
+more: a GPU-plugin inline accessor writes `guest_vblank_count_` at the offset the
+armed DLL uses for `ui_draw_next_iterator_`, and it does so on every emulated
+vblank. Moving that one accessor out of line (or making the option not shift the
+layout) removes the whole class of bug.
+
+Basis for the decision:
+
+- **keep on `feral/dlss`** — yes, as the test vehicle: it is the only build that
+  exercises the FSR path, and it is now instrumented and understood;
+- **keep off the install** — yes, until §11.7 lands. `ui_drawers_`-independent
+  workarounds (the fix shape) remove the crash this pass measured, but they leave
+  the corrupting write in place and leave `guest_vblank_count_` at 0, which means
+  the pacer's vblank cadence is wrong in the armed build even when it survives;
+- **do not revert the armed build to escape the crash** — the crash is a
+  one-function repair away, and reverting loses the FSR work.
+
+### 11.10 Artefacts from this pass
+
+- `thirdparty/rexglue-sdk-ui-drawer-instrumentation.patch` — regenerated
+  (278 lines) to include the topology + hexdump diagnostics used in §11.2(c);
+  verified with `git apply --check -R` to reproduce the modified source exactly
+  from pinned `cc5f03d`. The SDK tree itself is not committed.
+- `out/drawer-detect/` — armed + instrumentation, `f06ca75d…` (detector + fix
+  shape, used for arms D and F).
+- `out/drawer-detect2/` — armed + diagnostics, `4e388882…` (arms Z).
+- `out/off-detect/` — option-OFF + detector, `86cbcb6d…` (arms O).
+- `out/drawer-detect/batch-results.csv` — one row per launch: arm, rc, wall,
+  log, first-paint timestamp, alive-after-paint, chain, detection counts.
+- `out/drawer-detect/detect-{3,6,9,11,13,16,19}.txt` — the detector logs
+  (46 MB-class; `detect-19` carries the pre/post-draw hexdumps of §11.2(c)).
+- `out/drawer-detect/stdout-24.txt` — the `+seh` trace naming `+0xEC690`.
+- 24 launches, ledger `~/.hermes/logs/game-jobs.jsonl` (051-074).
+- `out/launchcheck/` restored to the option-OFF control pair (`a27a9a5b…`)
+  after the batch, as §9.4 left it.

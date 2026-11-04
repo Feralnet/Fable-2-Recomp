@@ -1,18 +1,19 @@
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 8986eec..6d10936 100644
+index 8986eec..5585f1a 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -13,6 +13,9 @@
+@@ -13,6 +13,10 @@
  #include <atomic>
  #include <cctype>
  #include <chrono>
 +#include <cstdarg>
 +#include <cstdio>
++#include <cstddef>
 +#include <cstdlib>
  #include <utility>
  
  #include <rex/assert.h>
-@@ -27,6 +30,61 @@
+@@ -27,6 +31,80 @@
  #include <ffx_api/ffx_upscale.h>
  #endif
  
@@ -69,12 +70,31 @@ index 8986eec..6d10936 100644
 +  std::fflush(file);
 +}
 +
++// Diagnostics for kanban t_683bb4e2: dump the bytes of the Presenter starting at
++// the real offset of ui_draw_next_iterator_, so a write that lands on it can be
++// located exactly (which byte changes, and by how much) around Draw().
++void UiDrawersHexdumpf(const char* tag, uint64_t walk, const void* self, std::ptrdiff_t offset) {
++  FILE* file = UiDrawersDetectFile();
++  if (!file) {
++    return;
++  }
++  const unsigned char* base = reinterpret_cast<const unsigned char*>(self) + offset;
++  char buffer[256];
++  int used = std::snprintf(buffer, sizeof(buffer), "walk %llu %s +%td:", walk, tag, offset);
++  for (int i = 0; i < 32 && used > 0 && used < static_cast<int>(sizeof(buffer)) - 4; ++i) {
++    used += std::snprintf(buffer + used, sizeof(buffer) - used, " %02x", base[i]);
++  }
++  std::fputs(buffer, file);
++  std::fputc('\n', file);
++  std::fflush(file);
++}
++
 +}  // namespace
 +
  REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                      "Allow presentation from non-UI thread");
  
-@@ -747,9 +805,15 @@ void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
+@@ -747,9 +825,15 @@ void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
      drawer_last_draw = it_existing->second.last_draw;
      // If removing the drawer that is the next in the current drawer loop, skip
      // it (in a multimap, only one element iterator is invalidated).
@@ -91,7 +111,7 @@ index 8986eec..6d10936 100644
      ui_drawers_.erase(it_existing);
      break;
    }
-@@ -760,6 +824,10 @@ void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
+@@ -760,6 +844,10 @@ void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
    if (is_executing_ui_drawers_ && z_order >= ui_draw_current_z_order_ &&
        (ui_draw_next_iterator_ == ui_drawers_.end() || z_order < ui_draw_next_iterator_->first)) {
      ui_draw_next_iterator_ = it_new;
@@ -102,7 +122,7 @@ index 8986eec..6d10936 100644
    }
    HandleUIDrawersChangeFromUIThread(drawers_were_empty);
  }
-@@ -772,9 +840,15 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
+@@ -772,9 +860,15 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
      }
      // If removing the drawer that is the next in the current drawer loop, skip
      // it (in a multimap, only one element iterator is invalidated).
@@ -119,11 +139,15 @@ index 8986eec..6d10936 100644
      ui_drawers_.erase(it_existing);
      HandleUIDrawersChangeFromUIThread(false);
      return;
-@@ -1283,9 +1357,92 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
+@@ -1283,25 +1377,136 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
    // Drawers can add or remove drawers (including themselves), need to ensure
    // iterator validity in this case.
    assert_false(is_executing_ui_drawers_);
 +  const bool ui_draw_detect = UiDrawersDetectEnabled();
++  // Real offset of the iterator within this object, so the diagnostic dump below
++  // does not have to hardcode a layout.
++  const std::ptrdiff_t ui_draw_iter_offset =
++      reinterpret_cast<const char*>(&ui_draw_next_iterator_) - reinterpret_cast<const char*>(this);
 +  if (UiDrawersFixEnabled()) {
 +    // Fix shape: no iterator is held across Draw().  The next drawer is
 +    // re-derived from the live map at every step, so a drawer that adds or
@@ -165,8 +189,10 @@ index 8986eec..6d10936 100644
 +  static uint64_t ui_draw_walk_index = 0;
 +  const uint64_t ui_draw_walk = ui_draw_walk_index++;
 +  if (ui_draw_detect) {
-+    UiDrawersDetectf("walk %llu enter: %zu drawer(s), ui_draw_current=%zu", ui_draw_walk,
-+                     ui_drawers_.size(), ui_draw_current_);
++    UiDrawersDetectf("walk %llu enter: %zu drawer(s), ui_draw_current=%zu begin=%p end=%p", ui_draw_walk,
++                     ui_drawers_.size(), ui_draw_current_,
++                     static_cast<const void*>(&(*ui_drawers_.begin())),
++                     static_cast<const void*>(&(*ui_drawers_.end())));
 +  }
    ui_draw_next_iterator_ = ui_drawers_.begin();
    is_executing_ui_drawers_ = true;
@@ -177,6 +203,7 @@ index 8986eec..6d10936 100644
 +    // dereferences the node instead of after the access violation.
 +    if (ui_draw_detect) {
 +      const void* ui_draw_node = static_cast<const void*>(&(*ui_draw_next_iterator_));
++      const void* ui_draw_first_live = static_cast<const void*>(&(*ui_drawers_.begin()));
 +      size_t ui_draw_live_count = 0;
 +      bool ui_draw_node_is_live = false;
 +      for (auto it_live = ui_drawers_.begin(); it_live != ui_drawers_.end(); ++it_live) {
@@ -189,9 +216,10 @@ index 8986eec..6d10936 100644
 +      if (!ui_draw_node_is_live) {
 +        UiDrawersDetectf(
 +            "DEAD ITERATOR walk %llu: next node %p is not among the %zu live node(s), "
-+            "ui_draw_current=%zu ui_draw_current_z_order=%zu executing=%d",
++            "ui_draw_current=%zu ui_draw_current_z_order=%zu executing=%d first_live=%p end=%p",
 +            ui_draw_walk, ui_draw_node, ui_draw_live_count, ui_draw_current_, ui_draw_current_z_order_,
-+            is_executing_ui_drawers_ ? 1 : 0);
++            is_executing_ui_drawers_ ? 1 : 0, ui_draw_first_live,
++            static_cast<const void*>(&(*ui_drawers_.end())));
 +        // Recover: continue with the first live node not yet drawn this frame.
 +        bool ui_draw_resynced = false;
 +        for (auto it_live = ui_drawers_.begin(); it_live != ui_drawers_.end(); ++it_live) {
@@ -212,7 +240,18 @@ index 8986eec..6d10936 100644
      // The current iterator may be invalidated, and ui_draw_next_iterator_ may
      // be changed, during the execution of the drawer if the list of the drawers
      // is modified by it - don't assume that after the call
-@@ -1298,10 +1455,18 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
+     // ui_draw_next_iterator_ will be the same as
+     // std::next(ui_draw_next_iterator_) before it.
+     auto it_current = ui_draw_next_iterator_++;
++    if (ui_draw_detect) {
++      UiDrawersDetectf("walk %llu advance: node=%p -> next=%p end=%p", ui_draw_walk,
++                       static_cast<const void*>(&(*it_current)),
++                       static_cast<const void*>(&(*ui_draw_next_iterator_)),
++                       static_cast<const void*>(&(*ui_drawers_.end())));
++    }
+     // Don't draw twice if already drawn in this frame (may happen if the Z
+     // order of a drawer was increased from below the current one to above it by
+     // one of the drawers).
      if (it_current->second.last_draw != ui_draw_current_) {
        ui_draw_current_z_order_ = it_current->first;
        it_current->second.last_draw = ui_draw_current_;
@@ -221,7 +260,13 @@ index 8986eec..6d10936 100644
 +                         static_cast<void*>(it_current->second.drawer),
 +                         static_cast<unsigned long long>(ui_draw_current_));
 +      }
++      if (ui_draw_detect) {
++        UiDrawersHexdumpf("pre-draw ", ui_draw_walk, this, ui_draw_iter_offset);
++      }
        it_current->second.drawer->Draw(ui_draw_context);
++      if (ui_draw_detect) {
++        UiDrawersHexdumpf("post-draw", ui_draw_walk, this, ui_draw_iter_offset);
++      }
      }
    }
    is_executing_ui_drawers_ = false;
