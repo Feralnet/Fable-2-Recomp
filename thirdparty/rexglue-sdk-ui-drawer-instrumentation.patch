@@ -1,0 +1,233 @@
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 8986eec..6d10936 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -13,6 +13,9 @@
+ #include <atomic>
+ #include <cctype>
+ #include <chrono>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -27,6 +30,61 @@
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++// ---------------------------------------------------------------------------
++// kanban t_683bb4e2 - ui_drawers_ iterator-invalidation detector.
++//
++// ExecuteUIDrawersFromUIThread holds ui_draw_next_iterator_ across a
++// caller-controlled UIDrawer::Draw() call, and the drawer is allowed to add or
++// remove drawers (including other ones, and itself) while it runs.  The erase
++// helpers advance the iterator when the node being erased *is* the next one,
++// which is correct for a single-threaded multimap, but nothing verifies it.
++//
++// With REX_UI_DRAWERS_DETECT pointing at a file, every walk iteration first
++// checks that the iterator still names a node that is live in ui_drawers_, logs
++// the exact interleaving when it does not, and recovers instead of walking the
++// freed node.  Without the variable the build is the ordinary one.
++// ---------------------------------------------------------------------------
++namespace {
++
++FILE* UiDrawersDetectFile() {
++  static FILE* file = []() -> FILE* {
++    const char* path = std::getenv("REX_UI_DRAWERS_DETECT");
++    if (!path || !*path) {
++      return nullptr;
++    }
++    return std::fopen(path, "a");
++  }();
++  return file;
++}
++
++bool UiDrawersDetectEnabled() { return UiDrawersDetectFile() != nullptr; }
++
++// Fix shape (kanban t_683bb4e2), off unless REX_UI_DRAWERS_FIX is set: instead
++// of holding an iterator into ui_drawers_ across the caller-controlled Draw()
++// call, re-derive the next drawer from the live map on every step, so nothing
++// this loop keeps can be erased underneath it.
++bool UiDrawersFixEnabled() {
++  const char* value = std::getenv("REX_UI_DRAWERS_FIX");
++  return value && *value && !(value[0] == '0' && value[1] == '\0');
++}
++
++void UiDrawersDetectf(const char* format, ...) {
++  FILE* file = UiDrawersDetectFile();
++  if (!file) {
++    return;
++  }
++  char buffer[512];
++  va_list args;
++  va_start(args, format);
++  std::vsnprintf(buffer, sizeof(buffer), format, args);
++  va_end(args);
++  std::fputs(buffer, file);
++  std::fputc('\n', file);
++  std::fflush(file);
++}
++
++}  // namespace
++
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
+@@ -747,9 +805,15 @@ void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
+     drawer_last_draw = it_existing->second.last_draw;
+     // If removing the drawer that is the next in the current drawer loop, skip
+     // it (in a multimap, only one element iterator is invalidated).
+-    if (is_executing_ui_drawers_ && ui_draw_next_iterator_ == it_existing) {
++    const bool ui_draw_erased_is_next = is_executing_ui_drawers_ && ui_draw_next_iterator_ == it_existing;
++    if (ui_draw_erased_is_next) {
+       ++ui_draw_next_iterator_;
+     }
++    if (UiDrawersDetectEnabled()) {
++      UiDrawersDetectf("Add-erase: drawer=%p z=%zu during_walk=%d erased_is_next=%d ui_draw_current=%zu",
++                       static_cast<void*>(drawer), z_order, is_executing_ui_drawers_ ? 1 : 0,
++                       ui_draw_erased_is_next ? 1 : 0, ui_draw_current_);
++    }
+     ui_drawers_.erase(it_existing);
+     break;
+   }
+@@ -760,6 +824,10 @@ void Presenter::AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order) {
+   if (is_executing_ui_drawers_ && z_order >= ui_draw_current_z_order_ &&
+       (ui_draw_next_iterator_ == ui_drawers_.end() || z_order < ui_draw_next_iterator_->first)) {
+     ui_draw_next_iterator_ = it_new;
++    if (UiDrawersDetectEnabled()) {
++      UiDrawersDetectf("Add-insert-in-walk: drawer=%p z=%zu ui_draw_current_z_order=%zu -> next set to new node",
++                       static_cast<void*>(drawer), z_order, ui_draw_current_z_order_);
++    }
+   }
+   HandleUIDrawersChangeFromUIThread(drawers_were_empty);
+ }
+@@ -772,9 +840,15 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
+     }
+     // If removing the drawer that is the next in the current drawer loop, skip
+     // it (in a multimap, only one element iterator is invalidated).
+-    if (is_executing_ui_drawers_ && ui_draw_next_iterator_ == it_existing) {
++    const bool ui_draw_removed_is_next = is_executing_ui_drawers_ && ui_draw_next_iterator_ == it_existing;
++    if (ui_draw_removed_is_next) {
+       ++ui_draw_next_iterator_;
+     }
++    if (UiDrawersDetectEnabled()) {
++      UiDrawersDetectf("Remove-erase: drawer=%p during_walk=%d removed_is_next=%d ui_draw_current=%zu",
++                       static_cast<void*>(drawer), is_executing_ui_drawers_ ? 1 : 0,
++                       ui_draw_removed_is_next ? 1 : 0, ui_draw_current_);
++    }
+     ui_drawers_.erase(it_existing);
+     HandleUIDrawersChangeFromUIThread(false);
+     return;
+@@ -1283,9 +1357,92 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
+   // Drawers can add or remove drawers (including themselves), need to ensure
+   // iterator validity in this case.
+   assert_false(is_executing_ui_drawers_);
++  const bool ui_draw_detect = UiDrawersDetectEnabled();
++  if (UiDrawersFixEnabled()) {
++    // Fix shape: no iterator is held across Draw().  The next drawer is
++    // re-derived from the live map at every step, so a drawer that adds or
++    // removes entries (including itself) while it runs cannot leave this loop
++    // dereferencing an erased node.  The Z floor keeps the original
++    // "only ever move forward" behaviour; nothing already drawn this frame is
++    // drawn twice.
++    is_executing_ui_drawers_ = true;
++    for (;;) {
++      ui_draw_next_iterator_ = ui_drawers_.end();
++      std::multimap<size_t, UIDrawerReference>::iterator it_next = ui_drawers_.end();
++      for (auto it_candidate = ui_drawers_.begin(); it_candidate != ui_drawers_.end(); ++it_candidate) {
++        if (it_candidate->second.last_draw == ui_draw_current_) {
++          continue;
++        }
++        if (it_candidate->first < ui_draw_current_z_order_) {
++          continue;
++        }
++        it_next = it_candidate;
++        break;
++      }
++      if (it_next == ui_drawers_.end()) {
++        break;
++      }
++      const size_t ui_draw_z_order = it_next->first;
++      UIDrawer* const ui_draw_drawer = it_next->second.drawer;
++      ui_draw_current_z_order_ = ui_draw_z_order;
++      it_next->second.last_draw = ui_draw_current_;
++      if (ui_draw_detect) {
++        UiDrawersDetectf("walk-fix draw: z=%zu drawer=%p ui_draw_current=%zu", ui_draw_z_order,
++                         static_cast<void*>(ui_draw_drawer), ui_draw_current_);
++      }
++      ui_draw_drawer->Draw(ui_draw_context);
++    }
++    is_executing_ui_drawers_ = false;
++    ++ui_draw_current_;
++    return;
++  }
++  static uint64_t ui_draw_walk_index = 0;
++  const uint64_t ui_draw_walk = ui_draw_walk_index++;
++  if (ui_draw_detect) {
++    UiDrawersDetectf("walk %llu enter: %zu drawer(s), ui_draw_current=%zu", ui_draw_walk,
++                     ui_drawers_.size(), ui_draw_current_);
++  }
+   ui_draw_next_iterator_ = ui_drawers_.begin();
+   is_executing_ui_drawers_ = true;
+   while (ui_draw_next_iterator_ != ui_drawers_.end()) {
++    // kanban t_683bb4e2: the iterator we are about to advance from must still
++    // name a node of the live tree - a drawer may have erased it during the
++    // Draw() call of the previous iteration.  Detect that before the walk
++    // dereferences the node instead of after the access violation.
++    if (ui_draw_detect) {
++      const void* ui_draw_node = static_cast<const void*>(&(*ui_draw_next_iterator_));
++      size_t ui_draw_live_count = 0;
++      bool ui_draw_node_is_live = false;
++      for (auto it_live = ui_drawers_.begin(); it_live != ui_drawers_.end(); ++it_live) {
++        ++ui_draw_live_count;
++        if (static_cast<const void*>(&(*it_live)) == ui_draw_node) {
++          ui_draw_node_is_live = true;
++          break;
++        }
++      }
++      if (!ui_draw_node_is_live) {
++        UiDrawersDetectf(
++            "DEAD ITERATOR walk %llu: next node %p is not among the %zu live node(s), "
++            "ui_draw_current=%zu ui_draw_current_z_order=%zu executing=%d",
++            ui_draw_walk, ui_draw_node, ui_draw_live_count, ui_draw_current_, ui_draw_current_z_order_,
++            is_executing_ui_drawers_ ? 1 : 0);
++        // Recover: continue with the first live node not yet drawn this frame.
++        bool ui_draw_resynced = false;
++        for (auto it_live = ui_drawers_.begin(); it_live != ui_drawers_.end(); ++it_live) {
++          if (it_live->second.last_draw != ui_draw_current_) {
++            ui_draw_next_iterator_ = it_live;
++            ui_draw_resynced = true;
++            break;
++          }
++        }
++        UiDrawersDetectf("DEAD ITERATOR walk %llu: recovery %s", ui_draw_walk,
++                         ui_draw_resynced ? "resynced to the next undrawn live node" : "terminating the walk");
++        if (!ui_draw_resynced) {
++          break;
++        }
++        continue;
++      }
++    }
+     // The current iterator may be invalidated, and ui_draw_next_iterator_ may
+     // be changed, during the execution of the drawer if the list of the drawers
+     // is modified by it - don't assume that after the call
+@@ -1298,10 +1455,18 @@ void Presenter::ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context) {
+     if (it_current->second.last_draw != ui_draw_current_) {
+       ui_draw_current_z_order_ = it_current->first;
+       it_current->second.last_draw = ui_draw_current_;
++      if (ui_draw_detect) {
++        UiDrawersDetectf("walk %llu draw: z=%zu drawer=%p last_draw=%llu", ui_draw_walk, it_current->first,
++                         static_cast<void*>(it_current->second.drawer),
++                         static_cast<unsigned long long>(ui_draw_current_));
++      }
+       it_current->second.drawer->Draw(ui_draw_context);
+     }
+   }
+   is_executing_ui_drawers_ = false;
++  if (ui_draw_detect) {
++    UiDrawersDetectf("walk %llu exit: %zu drawer(s) remain", ui_draw_walk, ui_drawers_.size());
++  }
+   ++ui_draw_current_;
+ }
+ 

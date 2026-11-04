@@ -2,7 +2,13 @@
 
 Status: **spike complete, pass proven running; the early guest self-exit is real
 but INTERMITTENT (~90 % of launches, not every one) and the bisection in §7
-cleared every named suspect — read §7 before §5's attribution.**
+cleared every named suspect — read §7 before §5's attribution.** §9 identified
+the failure as a crash, not a guest exit, and §10 names the crashing function
+from symbols, records a second armed-only binary difference (the `Presenter`
+layout moves by `0x10` when `REX_HAS_FIDELITYFX_SDK` is on) and **stages the
+detector + fix shape unmeasured** — the human gate lapsed before any launch, so
+the invalidated-iterator hypothesis is still open; §10.7 is the batch that
+settles it.
 Read "Launch outcomes" before using anything here.
 
 Branch: `feral/dlss`. SDK source: `/home/feral/toolchains/rexglue-sdk`
@@ -579,3 +585,280 @@ iterator walk in the presenter refresh path is fixed or disproved.
   (the `+seh` trace of the last instrumented run) — the per-run evidence.
 
 
+## 10. Iterator-invalidation pass (kanban `t_683bb4e2`) — the function is named, the instrument is built, the measurement is blocked
+
+**Bottom line: the site is now identified rather than inferred — `+0xEC690` is
+`rex::ui::Presenter::ExecuteUIDrawersFromUIThread` — and the detector plus the
+fix shape are built into a staged DLL. But `REX_HAS_FIDELITYFX_SDK` makes the
+option-OFF and option-ON builds disagree about the **layout of `Presenter`
+itself** (`ui_drawers_` at `0x1B8` vs `0x1C8`), which is an armed-only binary
+difference nobody had recorded. No launches were possible this pass: the human
+gate (`/run/user/1000/hermes-game.allow`) expired **2026-11-04 15:35:05**, so
+the crash rate of neither the instrumented build nor the fix was measured. The
+hypothesis is therefore **neither confirmed nor refuted by measurement** — read
+§10.5 for what the code says, and §10.7 for the one-batch test that settles it.**
+
+### 10.1 The function at `+0xEC690`, named from symbols (deliverable 1)
+
+The DLL has no COFF symbols and no PDB, but it was built from this tree by this
+toolchain, so the **compiler's own symbol table for the same compile** still
+exists in the build directory:
+
+```
+build/src/ui/CMakeFiles/rexui.dir/presenter.cpp.obj
+  .text+0x3ae0  ?ExecuteUIDrawersFromUIThread@Presenter@ui@rex@@IEAAXAEAVUIDrawContext@23@@Z
+```
+
+The DLL function at RVA `0xEC650` and that object symbol are **byte-for-byte
+identical for all 257 bytes** — same instruction bytes, same displacements, even
+the same internal branch offsets (`DLL 0xEC650+0xEC` == `obj 0x3ae0+0xEC`). So
+the containing function is named from the compiler's own record, not inferred:
+
+- `0xEC650..0xEC751` = **`rex::ui::Presenter::ExecuteUIDrawersFromUIThread(rex::ui::UIDrawContext&)`**
+- the fault at `+0xEC690` is `+0x40` into it;
+- it is a **separate out-of-line method, not a nested helper of
+  `RefreshGuestOutput`** — §9.2's "0x4F0 into that region" is wrong by an order
+  of magnitude (`0xEC650 - 0xEA160 = 0x24F0`); the nearest-export heuristic was
+  the only thing available without symbols, and it pointed one function too far
+  down.
+
+Decoded from the machine code, this is the drawer walk and nothing else:
+
+| `this` + | member |
+|---|---|
+| `0x1c8` | `ui_drawers_` (address of the `std::multimap`) |
+| `0x1d8` | `ui_draw_current_` |
+| `0x1e0` | `ui_draw_current_z_order_` |
+| `0x1e8` | `ui_draw_next_iterator_` (`_Ptr` only — Release, no iterator debugging) |
+| `0x1f0` | `is_executing_ui_drawers_` |
+
+and node `+0x00 _Left`, `+0x08 _Parent`, `+0x10 _Right`, `+0x18` colour,
+`+0x19` **isnil**, `+0x20` key (`z_order`), `+0x28` `drawer`, `+0x30`
+`last_draw` — a plain MSVC `std::_Tree_node`, which is why `0x19(%r8)` is the
+faulting operand. `+0xEC690` sits **inside the inlined
+`std::_Tree_iterator::operator++`** that computes `it_current =
+ui_draw_next_iterator_++`: it reads `rcx->_Right` for the node the iterator
+currently names, called with `rcx` = the *current* node of the iteration.
+
+### 10.2 What the code actually does (and what that means for the hypothesis)
+
+`src/ui/presenter.cpp:1280` (`ExecuteUIDrawersFromUIThread`; line numbers in this
+section are the pristine ones, +7 in the patched file) advances the
+iterator **before** calling `Draw()` and keeps the advanced iterator in the
+object (`ui_draw_next_iterator_++` is `mov %rdx,0x1e8(%rsi)` *before* the
+virtual `Draw` call at `+0xEC70A`). The next iteration therefore dereferences
+**the stored iterator**, not a freshly derived one — exactly the shape §9.2
+described.
+
+The mutation surface, exhaustively (grepped across `src/` and `include/`):
+
+- the **only** mutators of `ui_drawers_` are `AddUIDrawerFromUIThread` and
+  `RemoveUIDrawerFromUIThread` (`presenter.cpp:731-780`);
+- there is **no** `clear()`, no direct `erase()` anywhere else, and no other
+  container that the presenter iterates this way;
+- **both** mutators already advance the iterator when the node being erased *is*
+  the next one (`presenter.cpp:750`, `:775`), which is the complete guard for a
+  `multimap::erase`: only the erased element's iterator is invalidated.
+
+So **single-threaded, the invalidation this card hypothesises cannot happen** —
+the guard covers it. The walk runs on the UI thread only: the sole call site is
+`d3d12_presenter.cpp:1305`, inside `PaintAndPresentImpl`, reached from
+`PaintAndPresent(draw_ui)` in `PaintFromUIThread` (`presenter.cpp:554`); the
+guest-output thread calls `PaintAndPresent(false)` (`presenter.cpp:704`) and
+never enters the walk.
+
+Two things follow, and they are the useful result of this pass:
+
+1. **§9.2's "not a race" does not hold.** An identical RVA, `rsp`/`rbp` and call
+   depth are what you get for *any* crash at a fixed instruction in a fixed
+   function; they say nothing about whether another thread mutated the container
+   first. Determinism of the site is not determinism of the cause.
+2. If the stored iterator is dangling, the mutation has to come from **outside**
+   the guarded paths — either a thread other than the painting UI thread
+   (`is_executing_ui_drawers_` is a plain `bool` and `ui_drawers_` has no mutex,
+   so a cross-thread `Add`/`Remove`/`AddUIDrawerFromUIThread` is unsynchronised
+   and the guard is then meaningless; note also that in Release every
+   `assert_false(is_executing_ui_drawers_)` / `assert_true(is_in_ui_thread_paint_)`
+   is compiled out, `CMakeLists.txt:146` `-DNDEBUG`), or the node is corrupted
+   from elsewhere.
+
+Two latent defects found while reading, both worth fixing regardless:
+
+- `ui_draw_current_z_order_` (`presenter.h:1023`) has **no initialiser**. A
+  drawer added from another thread before the first `Draw()` of a walk reads an
+  indeterminate value in `AddUIDrawerFromUIThread:760`.
+- `AddUIDrawerFromUIThread:761` **dereferences the held iterator**
+  (`ui_draw_next_iterator_->first`) when it is not `end()`. If the iterator is
+  already dangling, *this* is the first read of freed memory, and the crash at
+  `+0xEC690` can be the second symptom rather than the first.
+
+### 10.3 The instrument (deliverable 2) — built, staged, not yet run
+
+`thirdparty/rexglue-sdk-ui-drawer-instrumentation.patch` (233 lines,
+`src/ui/presenter.cpp` only, verified to reproduce the modified file
+byte-for-byte from the pinned `cc5f03d`) adds, all env-gated and inert when the
+variables are unset:
+
+| env | effect |
+|---|---|
+| `REX_UI_DRAWERS_DETECT=<path>` | before every walk iteration, checks that the iterator names a node that is **live in `ui_drawers_`** by scanning the tree; on failure logs `DEAD ITERATOR walk N: next node <p> is not among the N live node(s)` with `ui_draw_current`, `ui_draw_current_z_order`, then **resyncs** to the first undrawn live node instead of walking the freed one. Also logs every `Add-erase` / `Remove-erase` with `during_walk=` and `erased_is_next=`, every `Add-insert-in-walk`, and per-walk `enter`/`draw`/`exit` lines (unbuffered `fopen`/`fprintf`/`fflush`, because §9.3 showed the log sink loses its buffer on this crash) |
+| `REX_UI_DRAWERS_FIX=1` | the fix shape: **no iterator is held across `Draw()`**. Each step re-derives the next drawer from the live map (first entry not yet drawn this frame with `z_order >= ui_draw_current_z_order_`), so nothing the loop keeps can be erased under it. Semantics: same forward-only Z ordering, same "never draw twice per frame", and drawers added during the walk at the current-or-higher Z are still drawn in the same frame |
+
+Built against the armed configuration (`REXGLUE_ENABLE_FSR1_RASTER=ON`) and
+staged, ready to drop into `out/launchcheck/` in seconds:
+
+```
+out/drawer-detect/rexruntime.dll       f06ca75d4ec89c34bbf89898b2af04c5
+out/drawer-detect/rexgpu-xenos.dll     6e405575fa8017779a8b104545c479fc
+```
+
+The walk is still identifiable in that DLL and still uses the armed offsets
+(`0x1c8`/`0x1d8`/`0x1e8`/`0x1f0`), now at RVA `0xECC14` because the fix branch
+precedes it. Nothing was staged into `out/launchcheck/` — that still holds the
+option-OFF control pair (`rexruntime.dll a27a9a5b…`), so the operator's lane is
+exactly as §9.4 left it.
+
+### 10.4 Why the option changes the binary at all (deliverable 4, first half)
+
+This is the finding §9 was missing, and it is a **binary** fact, not a theory:
+`REX_HAS_FIDELITYFX_SDK` adds four data members to
+`Presenter::GuestOutputPaintConfig` (`cas_additional_sharpness_`,
+`fsr_max_upsampling_passes_`, `fsr_sharpness_reduction_`, `fsr_quality_mode_`,
+`presenter.h:330-333`, setters at `:300-314`). `GuestOutputPaintConfig` is a `Presenter` member, so
+**every member after it moves by `0x10`** — including the drawer state. Measured
+in all three builds with the same byte motif:
+
+| build | `ui_drawers_` | `ui_draw_next_iterator_` | `is_executing_ui_drawers_` |
+|---|---|---|---|
+| `out/fsr-clean` (armed, `REXGLUE_ENABLE_FSR1_RASTER=ON`) | `0x1C8` | `0x1E8` | `0x1F0` |
+| `out/drawer-detect` (armed + instrumentation) | `0x1C8` | `0x1E8` | `0x1F0` |
+| `out/off-build` (option OFF) | `0x1B8` | `0x1D8` | `0x1E0` |
+
+The define is `PRIVATE` to the `rexui` target (`src/ui/CMakeLists.txt:124`,
+`:135`), so **no consumer of the SDK inherits it** — the game exe and the
+`rexgpu-xenos` plugin are compiled against the option-OFF layout while the
+armed DLL runs the option-ON layout. Today's checks say that hazard is latent
+rather than live:
+
+- the game exe (`rex_app.cpp` in `share/rexglue/`) only passes `Presenter*`
+  around (`SetPresenter`), never touching a member inline; the game build tree
+  contains no `REX_HAS_FIDELITYFX_SDK` anywhere in its compile flags;
+- no virtual function is gated, so the vtable is identical;
+- the plugin (`src/graphics/`) references none of the gated structs
+  (`GuestOutputPaintFlow` / `GuestOutputPaintConfig` / `GuestOutputPaintEffect`)
+  and only uses `D3D12GuestOutputRefreshContext` accessors, whose layout does not
+  depend on the define;
+- `D3D12Presenter::Create` (`d3d12_presenter.h:72`) allocates the presenter
+  **inside** `rexruntime.dll`, so no `sizeof` is taken by a mismatched TU.
+
+So the layout delta is a **real armed-only trap with no known consumer** — it is
+on the list, not at the top of it.
+
+### 10.5 Why the option makes an *inert* path crash (deliverable 4, second half)
+
+The decisive awkward fact from §9.4: every crashing armed launch was
+**bilinear** (`1 pass(es): #0 bilinear`). With `present_effect=bilinear` none of
+the FSR code runs, yet the armed build crashes 11/12 and the option-OFF build
+0/8. So "the extra shader/pipeline plumbing perturbs the refresh timing" cannot
+be the mechanism via the FSR passes themselves — the difference has to be
+something the define changes *structurally*, present even when the chain is one
+bilinear pass. Enumerated from the source, that is exactly:
+
+1. the `Presenter` layout `+0x10` (§10.4) and, with it, every offset the walk
+   uses;
+2. `kMaxGuestOutputPaintEffects` `1` → `6` (`presenter.h:487-495`), i.e. the
+   `GuestOutputPaintFlow` local in `GetGuestOutputPaintFlow` grows, and the
+   flow's loop bounds change;
+3. extra root signatures + the extra `present_*` cvars registered at startup
+   (restart-gated, so they only matter as construction work);
+4. everything else — code addresses, code size, allocation order.
+
+None of those is a *semantic* change to the drawer walk, which is why the
+hypothesis "the walk is invalidated" and the observation "only the armed build
+crashes" are still compatible with **both** a cross-thread mutation (C1) and a
+corruption of the node from elsewhere (C3). Ranked for the next pass:
+
+- **C1 — cross-thread mutation of `ui_drawers_` while the UI thread walks it.**
+  Test: `REX_UI_DRAWERS_DETECT` fires, and the log names the same node that an
+  `Add-erase`/`Remove-erase` line just touched. Near-conclusive if it fires.
+- **C2 — the `+0x10` layout delta reaching a mismatched TU.** Test: today's
+  evidence says no consumer exists; it moves up only if a new caller appears.
+- **C3 — memory corruption of the node from elsewhere in the armed build**
+  (§9.5's "FidelityFX dead code" remainder). Test: the detector stays silent for
+  a whole crashing launch — the walk then dies on a node that was never erased,
+  which refutes the invalidation hypothesis and points at corruption.
+- **C4 — presenter/paint teardown interleaving** (`SetPresenter(nullptr)` while a
+  walk is live). Test: same detector, teardown logged via the erase lines while
+  `is_executing_ui_drawers_` is set.
+
+### 10.6 Fix shape (deliverable 3) — built, not measured
+
+`REX_UI_DRAWERS_FIX=1` implements the card's option "otherwise stop holding an
+iterator across an erase window" as a **re-derived walk** rather than a copied
+snapshot, because a snapshot would drop drawers added mid-frame (the behaviour
+the guards at `presenter.cpp:800`/`:837` exist to preserve). If it measures ~0
+against a bracketing control, the invalidation hypothesis is confirmed and the
+mechanism is whatever the detector says erased the node. If the rate is
+unchanged, the hypothesis is **refuted** and the remainder is C3 (corruption) —
+the fix removes the *only* way this loop can read freed memory, so a crash that
+survives it is not this loop's bug.
+
+**No arm was run. No rate exists. This is not a null result, it is an
+unmeasured one**, and the card's own rule (5+ runs against a bracketing control,
+interleaved A B C C B A) is the bar.
+
+### 10.7 The exact next batch (blocked only on the human gate)
+
+The gate expired at **2026-11-04 15:35:05** — `game-job.sh --status` reports
+`launch_allowed: false`, `reason: "allow marker expired at …15:35:05"`,
+`expires_in_s: -1906`. Per the card the marker is never renewed by an agent, so
+this pass stops here rather than run a 2-launch sample it would have to
+disqualify.
+
+When a gate exists again, the batch is mechanical (each run is one 75 s lane):
+
+1. stage `out/drawer-detect/*.dll` into `out/launchcheck/`;
+2. **detector arm** — `REX_UI_DRAWERS_DETECT=Z:/…/out/drawer-detect/detect-armNN.txt`,
+   `REX_PRESENT_EFFECT=bilinear`, 5 runs + one prebuilt control bracketing;
+3. **fix arm** — same DLL with `REX_UI_DRAWERS_FIX=1`, 5 runs, control bracket;
+4. interleave (`A B C C B A …`) so drift cannot correlate with arm; keep the
+   resident `qwen3-tts` VRAM load equal (it was 4.0 GB free at the time of this
+   pass — no arm ran, so nothing was confounded, but the next batch must hold it
+   constant the way §9.4 did);
+5. record per launch: outcome (rc 5 / survived), time alive after first paint,
+   and whether `+0xEC690` recurs under `+seh`.
+
+### 10.8 FSR re-verification (deliverable 6) — NOT DONE, and nothing was broken
+
+An SDK rebuild **did** happen (the instrumented `rexruntime.dll` above), so the
+card's re-verification rule was in scope — but re-verifying needs a launch, and
+there was no gate. What protects the operator instead: **nothing was staged**;
+`out/launchcheck/` still holds the option-OFF control pair from §9.4
+(`rexruntime.dll a27a9a5b…`), and `out/fsr-clean/` (the armed reference,
+`13a5d065…`) is untouched. The instrumented pair lives only in
+`out/drawer-detect/`. The first launch of the next batch must still log the
+chain (`2 pass(es): #0 fsr-easu … #1 fsr-rcas`) with `present_effect=fsr` plus
+one dump pair before any rate is trusted.
+
+### 10.9 Recommendation (deliverable 5, for Marcus)
+
+**Keep the armed build off the operator's install, unchanged from §9.7.** This
+pass did not weaken the case against it — it *strengthened* it, by removing the
+guesswork about where it dies (a named presenter method, not an inferred helper)
+and by finding a second armed-only difference in the same object (the `+0x10`
+layout delta). But it did not produce the one thing that would let the build
+come back: a measured crash rate for the fix. Until that exists, the armed build
+is a known-11-in-12 crasher on a named instruction, and the branch keeps it
+without the operator running it.
+
+### 10.10 Artefacts from this pass
+
+- `thirdparty/rexglue-sdk-ui-drawer-instrumentation.patch` — the detector + fix
+  shape (233 lines, `src/ui/presenter.cpp`, reproduces byte-for-byte on the
+  pinned `cc5f03d`); the tenth SDK change, and the first that is inert with no
+  env var set.
+- `out/drawer-detect/{rexruntime.dll,rexgpu-xenos.dll}` — armed build carrying
+  it, `f06ca75d…` / `6e405575…`, staged but not installed anywhere.
+- **Zero launches this pass.** Ledger `~/.hermes/logs/game-jobs.jsonl` has no
+  entry from it; the only lane activity was `game-job.sh --status` (read-only,
+  no allow needed).
