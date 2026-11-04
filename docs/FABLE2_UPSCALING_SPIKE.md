@@ -1,8 +1,9 @@
 # Fable II recomp — upscaling spike: the FSR 1 present pass
 
-Status: **spike complete, pass proven running, but the FidelityFX-enabled runtime
-makes the guest session terminate itself.** Read "Launch outcomes" before using
-anything here.
+Status: **spike complete, pass proven running; the early guest self-exit is real
+but INTERMITTENT (~90 % of launches, not every one) and the bisection in §7
+cleared every named suspect — read §7 before §5's attribution.**
+Read "Launch outcomes" before using anything here.
 
 Branch: `feral/dlss`. SDK source: `/home/feral/toolchains/rexglue-sdk`
 (HEAD `cc5f03dd0488720a0f277412d7c36b63964d5b18` + the pre-existing local
@@ -187,9 +188,190 @@ not the monitor.
 - `out/orig-dlls/` — the prebuilt runtime/plugin the tree shipped with
   (`rexruntime.dll` md5 `726c8f7e…`, `rexgpu-xenos.dll` md5 `3417f468…`), so the
   launch layout can always be put back.
-- The FSR-enabled runtime is the build of the SDK + patch above; the binary used
-  for the evidence has md5 `1362d1e6…` (a rebuild from the same source hashes
-  differently — the DLL embeds build metadata), staged as
-  `out/upscale-build/rexruntime-fsr1.dll` + `rexgpu-xenos-fsr1.dll`.
+- The FSR-enabled runtime is the build of the SDK + patch above; the binary that
+  produced the evidence in §4 has md5 `1362d1e6…` (a rebuild from the same source
+  hashes differently — the DLL embeds build metadata), staged as
+  `out/upscale-build/rexruntime-fsr1.dll` + `rexgpu-xenos-fsr1.dll`. The §7 bisect
+  left that directory holding a post-bisect rebuild of the same source, md5
+  `13a5d065…` / `01a56d4e…`; `out/fsr-clean/` is the same pair under its bisect name.
 
 Nothing here has been posted anywhere; this is local work.
+
+## 7. Bisection pass (kanban `t_f73e8894`) — the three named suspects, cleared
+
+Method: the same launch layout and lane (`game-job.sh`, operator default output
+DP-1, window placed never activated, audio muted), **bilinear** as the probe, the
+lane's own 70–75 s timer as the survival bar. Every arm below was a real launch in
+this session; the prebuilt DLLs and/or the option-OFF source build are the control
+in every batch. Individual runs are logged `out/launchcheck/logs/fable_2_0NN.log`
+(NN as in the table), ledger `~/.hermes/logs/game-jobs.jsonl`.
+
+**Finding 0, which changes how every number below must be read: the failure is
+intermittent.** The *same binary* both self-exited and survived (arm D, md5
+`915758d5…`: died at 16.2 s and 41 s, survived 74 s). Across all guard-ON builds
+in this session it self-exits in **9 of 10** launches; across option-OFF and
+prebuilt launches, **0 of 3 and 0 of 2**. So a single run per arm proves nothing —
+the exclusions below are on *rates*, not on one surviving or one dying launch.
+
+| arm | what was compiled out / changed | runs | self-exit | survived | time after 1st paint | last-second `WAIT_REG_MEM` |
+|---|---|---|---|---|---|---|
+| A0 | control: prebuilt 0.10.0 DLLs | 1 | 0 | 1 | — (full 80 s timer) | 306/s |
+| A1 | nothing (patch as committed), bilinear | 1 | 1 | 0 | 18.2 s | 675/s |
+| B | nothing; bisect instrumentation added | 1 | 1 | 0 | 14.4 s | 215/s |
+| C | suspect 2: ffx root signatures + `guest_output_ffx_*` PSOs | 1 | 1 | 0 | 4.3 s | 274/s |
+| D | suspects 1+2: C, plus the six `present_*` cvars and the config population | 6 | 5 | 1 | 5.8 / 11.3 / 16.2 / 30.6 / ~45 s | 207–931/s |
+| E | control: option **OFF** source build (fresh, Ninja) | 2 | 0 | 2 | — (full 80 s timer ×2) | 132, 297/s |
+| F | patch as committed, bilinear, repeats | 4 | 3 | 1 | 6.5 / 25 / 39.3 s | 201–910/s |
+| F' | patch as committed + an exit-reason probe in `rex_app.cpp` (never compiled — see below) | 2 | 2 | 0 | 12.0 / 64.6 s | 228, 289/s |
+| G | `kMaxGuestOutputPaintEffects` forced back to 1 (the non-Fable2 value) | 4 | 4 | 0 | 5.0 / 5.2 / 10.6 / 13.2 s | 227–281/s |
+
+Armed-build total this pass (A1, B, F, F', and the two §7.1 runs): **9 self-exits
+in 10 launches**. Controls in this batch: A0 (prebuilt) and E (option OFF, two
+fresh builds) — both survive the full timer, every time, 3 of 3 including §5's, and
+never logged a self-exit.
+
+### The three suspects, one at a time
+
+1. **The extra `present_*` cvars and the config plumbing they feed — CLEARED.**
+   Instrumentation first, because it makes the exclusion structural rather than
+   statistical: `BuildGuestOutputPaintConfigFromCVar` runs **once** (from
+   `InitializeCommonSurfaceIndependent`, logged `bisect: paint config from cvars:
+   effect=0 cas=0.0000 fsr_sharp=0.2000 max_passes=4 quality=0 dither=false`), and
+   `SetGuestOutputPaintConfigFromUIThread` is **never called at all** (the probe at
+   its entry logged zero calls in the whole session) — nothing in the runtime or the
+   game calls it, so its FidelityFX comparison blocks are dead code here. Compiling
+   the six cvars and the config population out as well (arm D) left the rate
+   unchanged at 5/6 self-exit.
+2. **The `guest_output_ffx_*` pipeline set — CLEARED.** Arming the build with the
+   root-signature block and every FidelityFX PSO case compiled out leaves exactly
+   the plain build's set (`bisect: guest output PSOs after init: 0 intermediate, 2
+   final (of 9 effects)` versus `4 intermediate, 8 final` with the code in). Still
+   self-exits: arm C 1/1, arm D 5/6.
+3. **The intermediate-texture bookkeeping — CLEARED, and vacuously so.** In a
+   bilinear run the presenter never allocates an intermediate texture at all: the
+   probe at the creation point logged **zero** allocations in every bilinear run
+   (the loop requests `(0,0)` for all `i` when `effect_count == 1`). There is no
+   multi-pass bookkeeping to bisect until an FSR pass is actually scheduled.
+
+Also cleared, this pass, by rate rather than by one run:
+`kMaxGuestOutputPaintEffects` back to 1 (arm G, 4/4 self-exit) — so the bigger flow
+arrays / descriptor counts are not the cause either, which corroborates §5's
+single-run array-size test with four more launches.
+
+### What is left inside the guard
+
+Every code path that *runs* in a bilinear launch has now been compiled out and the
+behaviour did not change, so the remainder has to be something that does not need a
+running code path:
+
+- the seven vendored `guest_output_ffx_*` DXIL blobs compiled into the runtime
+  image (the option adds ~73 KB to `rexruntime.dll`: 9 668 608 B armed versus
+  9 595 392 B plain — arm C keeps the `#include`s, only the PSO cases go);
+- FidelityFX-guarded code with no executed path in a bilinear run: the
+  effect-name `switch`, `ParsePresentEffect`'s `cas`/`fsr*` branches, the
+  `LogTemporalFsr*` helpers, the extra `switch` cases in the paint loop, and the
+  larger per-paint `effect_constants` union on the stack;
+- `GuestOutputPaintConfig`'s FidelityFX fields (layout only).
+
+So the shape is now: **data/layout or a timing-sensitive race that the armed build
+shifts, not a logic defect in the three places the previous pass named.**
+
+### The `WAIT_REG_MEM` climb is a symptom, not the signature
+
+The previous pass read the failure as a frame-pacing stall from the
+`WAIT_REG_MEM` rate climbing 230 → 685 → 917/s. That does not hold across the runs
+above: self-exits end at 201, 207, 215, 227, 229, 230, 234, 274, 289, 675, 909, 910
+and 911/s, and surviving runs sit at 132–306/s. Arm D ended with a **flat 230/s**
+and no stall at all. The high numbers appear when the guest stops submitting frames
+(it is already on its way out); they are the consequence, not the cause. The guest
+main thread simply returns — `Execution complete` — with no error, no
+`Window closing`, and nothing from the runtime explaining why.
+
+### Where to go next (the cheap tests, in order)
+
+1. **Ask the guest why.** The runtime logs nothing at the exit point. `Execution
+   complete` is emitted by `ReXApp::LaunchModule` in `src/ui/rex_app.cpp`, which is
+   **not** part of the `rexui` target and not in the runtime DLL's build graph (it
+   is compiled by the game exe), so a reason probe is a *game* rebuild, not an SDK
+   one: log `X_KTHREAD::exit_status` / `last_error` right at `OnGuestThreadExit` in
+   the module-thread lambda. That was attempted here inside the SDK and could not
+   take effect — `git grep rex_app.cpp build/build.ninja` is empty.
+2. **Data-presence test for the blobs**: replace the seven `guest_output_ffx_*_ps.h`
+   includes with zero-length arrays (no PSO uses them) and re-run — a rate drop
+   names the blobs, a flat rate excludes the image-size theory.
+3. **Present-path timing**: same armed build with `present_dither=1` (one extra
+   shader branch) and with a different swap-chain size — if the rate tracks
+   *anything* that changes present timing, it is a race in the present handshake,
+   not the upscaler.
+
+### Artefacts from this pass
+
+- `out/bisect-armCD/` — arm D runtime (`rexruntime-armCD.dll`, md5 `915758d5…`).
+- `out/bisect-kmax1/` — arm G runtime (md5 `d2d4d26d…`).
+- `out/fsr-clean/` — the patch as committed, rebuilt after the bisect (md5
+  `13a5d065…`); this is the binary the FSR re-verification in §7.1 used.
+- `out/off-build/` — the option-OFF control build (md5 `a27a9a5b…`).
+- `out/upscale-dumps/verify-bilinear/`, `verify-fsr/` — the re-verification dumps.
+
+### 7.1 FSR re-verified after the bisect
+
+Armed build `13a5d065…`, same layout, dumps at paint 300 / 700 (every 400):
+
+| run | chain logged |
+|---|---|
+| `verify-bilinear` | `1 pass(es): #0 bilinear -> 2560x1440` |
+| `verify-fsr` | `2 pass(es): #0 fsr-easu -> 2560x1440 #1 fsr-rcas -> 2560x1440` |
+
+Six dumps per run, all 3440x1440. Both runs then self-exited (16.7 s and 13.6 s
+after first paint) — expected, arms A1/F do the same. Metric on the pair: the two
+runs are **not** the same video frame this time (whole-frame RMSE 2.9/255 at paint
+300, 16.2/255 at paint 700, versus 0.56 for the frame-matched pair in §4), so only
+the crop is comparable: the busiest 900x240 text region gains Laplacian std
+1.106 → 2.026 (**+83 %**) at paint 300 and 1.234 → 3.120 (**+153 %**) at paint 700.
+The pass still runs; the frame-matched numbers stay §4's.
+
+## 8. SDK reproducibility: what is captured, and the patch that closes the gap
+
+The SDK tree at `/home/feral/toolchains/rexglue-sdk` (HEAD `cc5f03d`) carries
+uncommitted modifications to **8** files (5 at the time the card was written; the
+FSR-1 raster patch adds the other 3). Mapping each against the patches tracked in
+`thirdparty/`:
+
+| file | tracked patch | state |
+|---|---|---|
+| `CMakeLists.txt` | `rexglue-sdk-fsr1-raster.patch` | exact |
+| `include/rex/ui/d3d12/d3d12_presenter.h` | `rexglue-sdk-fsr1-raster.patch` | exact |
+| `src/ui/CMakeLists.txt` | `rexglue-sdk-fsr1-raster.patch` | exact |
+| `src/ui/d3d12/d3d12_presenter.cpp` | `rexglue-sdk-fsr1-raster.patch` | exact |
+| `include/rex/perf/counter.h` | `rexglue-sdk-local.patch` (partial) | **was not reproducible** |
+| `src/core/perf/counter.cpp` | none | **was not reproducible** |
+| `src/system/runtime.cpp` | none | **was not reproducible** |
+| `src/graphics/d3d12/command_processor.cpp` | none | **was not reproducible** |
+
+`rexglue-sdk-local.patch` does **not** apply to the pinned commit at all (it fails
+on `src/graphics/command_processor.cpp` and `src/ui/vulkan/vulkan_presenter.cpp`),
+so it cannot reproduce the tree — and `tools/setup_sdk_src.cmd` pins
+`f5337cdc…` while the built tree is at `cc5f03d`, which is the root of that drift.
+
+What the four uncovered files actually are (two features, not drift):
+
+- **perf CSV recorder** — `counter.cpp` + `runtime.cpp` + `counter.h`: wires the
+  already-exported `perf_log_csv` cvar / CSV writer, which nothing used to read
+  (`REX_PERF_LOG_CSV=<path>` wrote no file). `StartCsvLogFromCvar()` is called from
+  `Runtime::Setup`, `WriteCsvFrame()` from `ResetFrameCounters()`, `FlushCsv()`
+  from `Runtime::Shutdown()`.
+- **Fable 2 vertex-constant dump probe** — `d3d12/command_processor.cpp`: an
+  env-gated, read-only probe (`FABLE2_VC_DUMP`, `_EVERY`, `_PER_FRAME`, `_LO/_HI`)
+  that appends vertex-constant-block snapshots from both register-write paths.
+
+Both are captured as **`thirdparty/rexglue-sdk-perf-csv-and-vc-dump.patch`**
+(4 files, 165 insertions / 2 deletions), generated against the pinned commit.
+
+**Verified reproduction**: on a clean worktree of `cc5f03d`, applying
+`rexglue-sdk-fsr1-raster.patch` and then
+`rexglue-sdk-perf-csv-and-vc-dump.patch` reproduces **all eight** modified files
+byte-for-byte (`diff -q` identical for every one, no extra files). That pair, on
+the pin, is the durable state; nothing was committed to the SDK tree itself.
+`tools/setup_sdk_src.cmd` now applies the new patch after the FSR one, with the
+same "only if it applies cleanly" guard.
+
