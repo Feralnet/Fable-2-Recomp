@@ -152,17 +152,26 @@ Attribution, from the controls:
 - **Not the FSR shaders**: bilinear-only runs with the option ON exit too.
 
 So it is something in the **`REX_HAS_FIDELITYFX_SDK`-gated presenter code
-path itself**, independent of which effect is selected. The numbers point at a
-frame-pacing stall rather than a crash: the GPU `WAIT_REG_MEM` long-wait rate
-climbs 230 → 685 → 917/s in the last two seconds before the guest returns, where
-the surviving control sits flat at ~333/s. Candidates inside the guard, none of
-which were bisected yet: `kMaxGuestOutputPaintEffects` (1 → 4), the intermediate
-texture / `guest_output_intermediate_texture_last_usage` machinery, and the
-`SetGuestOutputPaintConfigFromUIThread` repaint path (the presenter now owns a
-multi-pass chain the guest's swap wait may be starved by).
+path itself**, independent of which effect is selected. Two more exclusions were
+run before that conclusion was written down:
 
-Bisecting those three is the next pass; it is a presenter-side problem, not a
-shader or a Fable-side one.
+- **Not the effect array size**: rebuilding with `kMaxGuestOutputPaintEffects`
+  forced back to 1 (`#if defined(REX_HAS_FIDELITYFX_SDK)` branch, i.e. the same
+  value the non-FidelityFX build uses) and running bilinear still self-exits,
+  4 s after first paint. That was a temporary local edit; the patch in this repo
+  does not contain it.
+- **Not the shaders**: no FSR pass is ever scheduled in the bilinear runs.
+
+The numbers point at a frame-pacing stall rather than a crash: the GPU
+`WAIT_REG_MEM` long-wait rate climbs 230 → 685 → 917/s in the last two seconds
+before the guest returns, where the surviving control sits flat at ~333/s.
+What is left inside the guard, none of it bisected yet: the extra
+`present_*` cvars and the config plumbing they feed
+(`BuildGuestOutputPaintConfigFromCVar` / `SetGuestOutputPaintConfigFromUIThread`,
+which the FidelityFX build populates and the plain build does not), the
+guest-output pipeline set created for the vendored `guest_output_ffx_*` shaders,
+and the intermediate-texture bookkeeping. That is the next pass; it is a
+presenter-side problem, not a shader or a Fable-side one.
 
 Observed oddity worth knowing: the swap chain is 3440x1440 while the display the
 window is placed on (DP-1) is 2560x1440 — the dumps are 3440x1440 with the
@@ -178,7 +187,9 @@ not the monitor.
 - `out/orig-dlls/` — the prebuilt runtime/plugin the tree shipped with
   (`rexruntime.dll` md5 `726c8f7e…`, `rexgpu-xenos.dll` md5 `3417f468…`), so the
   launch layout can always be put back.
-- The FSR-enabled runtime is `rexruntime.dll` md5 `1362d1e6…`
-  (build of the SDK + patch above).
+- The FSR-enabled runtime is the build of the SDK + patch above; the binary used
+  for the evidence has md5 `1362d1e6…` (a rebuild from the same source hashes
+  differently — the DLL embeds build metadata), staged as
+  `out/upscale-build/rexruntime-fsr1.dll` + `rexgpu-xenos-fsr1.dll`.
 
 Nothing here has been posted anywhere; this is local work.
