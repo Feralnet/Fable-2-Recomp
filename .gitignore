@@ -54,3 +54,8 @@ thirdparty/android-ndk/
 # --- Historical reference (pre-ReXGlue XenonRecomp configs) -------------------
 XenonRecomp
 TODO.md
+
+# --- vkd3d-proton shader/pipeline cache, written when a launch runs from
+# --- the repo root (agent runs do; out/launchcheck is the staged layout). ----
+vkd3d-proton.cache
+vkd3d-proton.cache.write
