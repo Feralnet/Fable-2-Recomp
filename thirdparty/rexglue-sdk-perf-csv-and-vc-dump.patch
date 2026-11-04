@@ -1,0 +1,251 @@
+diff --git a/include/rex/perf/counter.h b/include/rex/perf/counter.h
+index b3947e0..7bd587e 100644
+--- a/include/rex/perf/counter.h
++++ b/include/rex/perf/counter.h
+@@ -75,6 +75,8 @@ int64_t GetSnapshotCounter(CounterId id);
+ void Init();
+ 
+ // CSV logging
++// Startup: resolve `perf_log_csv` and open the log (no-op when the cvar is empty).
++void StartCsvLogFromCvar();
+ void SetCsvLogPath(const std::string& path);
+ void WriteCsvFrame();
+ void FlushCsv();
+@@ -107,8 +109,7 @@ class Profiler {
+     }
+ #endif
+ #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+-    ResetFrameCounters();
+-    WriteCsvFrame();
++    ResetFrameCounters();  // snapshots the frame and emits its CSV row
+ #endif
+   }
+   static void Flush() {}
+diff --git a/src/core/perf/counter.cpp b/src/core/perf/counter.cpp
+index 536009e..20c4fa5 100644
+--- a/src/core/perf/counter.cpp
++++ b/src/core/perf/counter.cpp
+@@ -112,6 +112,10 @@ void ResetFrameCounters() {
+                           std::memory_order_relaxed);
+     }
+   }
++
++  // Frame boundary: emit the row for the frame just snapshotted. No-op unless StartCsvLogFromCvar()
++  // opened a log, so this costs one null check per frame when the recorder is off.
++  WriteCsvFrame();
+ }
+ 
+ int64_t GetSnapshotCounter(CounterId id) {
+@@ -125,6 +129,25 @@ void Init() {
+     s.store(0, std::memory_order_relaxed);
+ }
+ 
++// Resolve the perf_log_csv cvar (once) and open the CSV log if it is set.
++// `perf_log_csv` and the CSV writer were exported but never wired: nothing read the cvar, so
++// REX_PERF_LOG_CSV=<path> wrote no file. Startup calls this after the cvar config and environment
++// have been applied; repeated calls are no-ops so a second call cannot truncate the log.
++void StartCsvLogFromCvar() {
++  static bool resolved = false;
++  if (resolved)
++    return;
++  resolved = true;
++
++  std::string path = REXCVAR_GET(perf_log_csv);
++  if (path.empty())
++    return;
++
++  SetCsvLogPath(path);
++  if (g_csv_file)
++    REXLOG_INFO("perf: CSV frame log -> {}", path);
++}
++
+ void SetCsvLogPath(const std::string& path) {
+   if (g_csv_file) {
+     std::fflush(g_csv_file);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 6f1a7a3..8d0973f 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -11,9 +11,13 @@
+ 
+ #include <algorithm>
+ #include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <sstream>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+@@ -1768,8 +1772,136 @@ void D3D12CommandProcessor::ShutdownContext() {
+   CommandProcessor::ShutdownContext();
+ }
+ 
++// ---------------------------------------------------------------------------
++// Fable2 vertex-constant dump probe — env-gated, read-only, inert unless
++// FABLE2_VC_DUMP is set. Called from both register-write paths, because the game
++// reaches the vertex constant block through BOTH of them (bulk range packets and
++// single-register writes).
++//   FABLE2_VC_DUMP=<path>[;<path>...]  append 256xfloat4 snapshots, first writable wins
++//   FABLE2_VC_DUMP_EVERY=<n>           sample every n-th frame (default 60)
++//   FABLE2_VC_DUMP_PER_FRAME=<n>       cap snapshots per sampled frame (default 40)
++//   FABLE2_VC_DUMP_LO/_HI=<slot>       only snapshots when the written float4 slot
++//                                      falls inside [LO,HI] (default 0..255)
++// A block identical to the previously written one is skipped.
++// ---------------------------------------------------------------------------
++static void Fable2VcDumpProbe(const RegisterFile& rf, uint64_t frame_current,
++                              uint32_t first_reg, uint32_t last_reg) {
++  static const std::vector<std::string> vc_paths = [] {
++    std::vector<std::string> out;
++    const char* e = std::getenv("FABLE2_VC_DUMP");
++    if (e) {
++      std::string s(e);
++      size_t start = 0;
++      while (start <= s.size()) {
++        size_t sep = s.find(';', start);
++        std::string part =
++            s.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
++        if (!part.empty()) {
++          out.push_back(part);
++        }
++        if (sep == std::string::npos) {
++          break;
++        }
++        start = sep + 1;
++      }
++    }
++    return out;
++  }();
++  static const int vc_every = [] {
++    const char* e = std::getenv("FABLE2_VC_DUMP_EVERY");
++    return e ? std::atoi(e) : 60;
++  }();
++  static const int vc_per_frame = [] {
++    const char* e = std::getenv("FABLE2_VC_DUMP_PER_FRAME");
++    return e ? std::atoi(e) : 40;
++  }();
++  static const int vc_lo = [] {
++    const char* e = std::getenv("FABLE2_VC_DUMP_LO");
++    return e ? std::atoi(e) : 0;
++  }();
++  static const int vc_hi = [] {
++    const char* e = std::getenv("FABLE2_VC_DUMP_HI");
++    return e ? std::atoi(e) : 255;
++  }();
++  static int vc_which = -1;
++  static bool vc_probed = false;
++  static uint32_t vc_last_hash = 0;
++  static bool vc_have_hash = false;
++  static uint64_t vc_last_frame = UINT64_MAX;
++  static int vc_frame_dumps = 0;
++  if (vc_paths.empty()) {
++    return;
++  }
++  if (!vc_probed) {
++    // proof the probe is in the loaded DLL and reached, whatever the path does
++    vc_probed = true;
++    if (FILE* m = std::fopen("vc-probe-alive.txt", "a")) {
++      std::fprintf(m, "vc-probe alive: %zu candidate path(s)\n", vc_paths.size());
++      std::fclose(m);
++    }
++  }
++  if (vc_which < 0) {
++    for (size_t i = 0; i < vc_paths.size(); ++i) {
++      if (FILE* t = std::fopen(vc_paths[i].c_str(), "a")) {
++        std::fclose(t);
++        vc_which = static_cast<int>(i);
++        break;
++      }
++    }
++  }
++  if (vc_which < 0) {
++    return;
++  }
++  int32_t first_slot = static_cast<int32_t>((first_reg - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2);
++  int32_t last_slot = static_cast<int32_t>((last_reg - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2);
++  if (last_slot < vc_lo || first_slot > vc_hi) {
++    return;
++  }
++  uint64_t interval = vc_every > 0 ? static_cast<uint64_t>(vc_every) : 60;
++  if (frame_current % interval != 0) {
++    return;
++  }
++  if (frame_current != vc_last_frame) {
++    vc_last_frame = frame_current;
++    vc_frame_dumps = 0;
++  }
++  if (vc_frame_dumps >= (vc_per_frame > 0 ? vc_per_frame : 40)) {
++    return;
++  }
++  const uint32_t* blk = rf.values + XE_GPU_REG_SHADER_CONSTANT_000_X;
++  uint32_t h = 2166136261u;
++  for (uint32_t i = 0; i < 1024; ++i) {
++    h = (h ^ blk[i]) * 16777619u;
++  }
++  if (vc_have_hash && h == vc_last_hash) {
++    return;  // unchanged block: nothing to record
++  }
++  vc_last_hash = h;
++  vc_have_hash = true;
++  ++vc_frame_dumps;
++  FILE* f = std::fopen(vc_paths[static_cast<size_t>(vc_which)].c_str(), "a");
++  if (!f) {
++    return;
++  }
++  std::fprintf(f, "VC frame=%llu start_reg=%u n=%u dump_in_frame=%d\n",
++               static_cast<unsigned long long>(frame_current), first_reg,
++               last_reg - first_reg + 1, vc_frame_dumps);
++  for (uint32_t i = 0; i < 256; ++i) {
++    float v[4];
++    std::memcpy(v, &rf.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * i], 16);
++    std::fprintf(f, "  vc[%3u] % .7g % .7g % .7g % .7g\n", i, v[0], v[1], v[2], v[3]);
++  }
++  std::fclose(f);
++}
++
+ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+   CommandProcessor::WriteRegister(index, value);
++  if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W &&
++      ((index - XE_GPU_REG_SHADER_CONSTANT_000_X) & 3) == 0) {
++    // one probe per float4 (.x of each), not per dword: a full block upload is 1024
++    // single-register writes and probing each of them buries the per-frame budget
++    Fable2VcDumpProbe(*register_file_, frame_current_, index, index);
++  }
+ 
+   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+     if (frame_open_) {
+@@ -1837,6 +1969,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
+   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+     memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
++    Fable2VcDumpProbe(*register_file_, frame_current_, start_index, end_index);
+     if (frame_open_) {
+       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..183b6d3 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -104,6 +104,11 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+   // Initialize SEH exception support for hardware exception handling
+   rex::initialize_seh();
+ 
++  // Perf CSV recorder: `Perf -> perf_log_csv` (REX_PERF_LOG_CSV=<path>) is declared by the SDK and
++  // its writer is exported, but nothing used to read the cvar. Resolve it once here — cvar config
++  // and environment are already applied — and open the log; ResetFrameCounters() emits the rows.
++  rex::perf::StartCsvLogFromCvar();
++
+   // Initialize clock
+   chrono::Clock::set_guest_tick_frequency(50000000);
+   chrono::Clock::set_guest_system_time_base(chrono::Clock::QueryHostSystemTime());
+@@ -284,6 +289,7 @@ void Runtime::Shutdown() {
+   memory_.reset();
+ 
+   rex::perf::Profiler::Shutdown();
++  rex::perf::FlushCsv();  // release the CSV log on a clean exit (hard exits keep the last flush)
+   setup_complete_ = false;
+ }
+ 

@@ -13,6 +13,9 @@ rem
 rem Pinned inputs (all in thirdparty/, tracked in this repo):
 rem   rexglue-sdk-local.patch            - local SDK modifications (main-menu
 rem                                        crash fix, Vulkan + FPS work)
+rem   rexglue-sdk-fsr1-raster.patch      - gated FSR 1 / CAS raster present pass
+rem   rexglue-sdk-perf-csv-and-vc-dump.patch - perf CSV recorder wiring + the
+rem                                        Fable 2 vertex constant dump probe
 rem   rexglue-sdk-submodule-pins.txt     - submodule SHAs the current DLLs
 rem                                        were built against
 rem ===========================================================================
@@ -98,6 +101,24 @@ if exist "%PATCH_FSR1%" (
         git apply "%PATCH_FSR1%"
         if errorlevel 1 (
             echo Error: applying the FSR 1 raster SDK patch failed. 1>&2
+            popd
+            exit /b 1
+        )
+    )
+)
+rem Optional third patch: the perf CSV recorder wiring + the Fable 2 vertex
+rem constant dump probe (see docs/FABLE2_UPSCALING_SPIKE.md section 8). These
+rem were carried as undocumented local modifications before; without them the
+rem tree at the pin is not reproducible. Same rule: only apply when it fits.
+set "PATCH_PERF=%REPO%\thirdparty\rexglue-sdk-perf-csv-and-vc-dump.patch"
+if exist "%PATCH_PERF%" (
+    git apply --check "%PATCH_PERF%" >nul 2>&1
+    if errorlevel 1 (
+        echo Note: %PATCH_PERF% does not apply to this SDK pin - skipping.
+    ) else (
+        git apply "%PATCH_PERF%"
+        if errorlevel 1 (
+            echo Error: applying the perf CSV / vertex constant probe SDK patch failed. 1>&2
             popd
             exit /b 1
         )
