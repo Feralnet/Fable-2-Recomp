@@ -1,0 +1,56 @@
+# --- Game content (ripped disc; see README "How to extract") ---------------
+default.xex
+/data/
+/nxeart/
+/$SystemUpdate/
+/Gamefiles/
+
+# --- Build artifacts --------------------------------------------------------
+out
+generated
+nul
+
+
+# --- AI Agent Stuff --------------------------------------------------------
+.pi
+pi-session-*.html
+.claude/*
+!.claude/skills/
+
+# --- Runtime logs written next to the exe (may land in the root when running
+#     with --game_data_root) ---------------------------------------------------
+fable2_func_trace.log
+fable2_func_trace_prev.log
+fable2_func_summary.log
+fable2_func_summary_prev.log
+fps_probe.log
+
+# --- SDK / runtime artifacts ------------------------------------------------
+.fable2_image.bin
+
+# --- Local scratch (old build logs, screenshots, session exports,
+#     stray runtime content folders) ------------------------------------------
+/scratch/
+
+# --- Manifest backup (pre-rename safety copy) --------------------------------
+fable_2_manifest.toml.bak
+
+# --- Scratch helpers in the repo root -----------------------------------------
+/*.ps1
+/*.py
+/*.sh
+/*.png
+build_*.log
+rebuild.log
+rebuild2.log
+__pycache__/
+
+# --- Fetched/external toolchain deps (created by tools/setup_sdk*.cmd). -------
+# The tracked files in thirdparty/ (rexglue-sdk-local.patch,
+# rexglue-sdk-submodule-pins.txt, vulkan/, vk_video/) stay in the repo.
+thirdparty/rexglue-sdk-src/
+thirdparty/android-ndk/
+
+# --- Historical reference (pre-ReXGlue XenonRecomp configs) -------------------
+XenonRecomp
+TODO.md
