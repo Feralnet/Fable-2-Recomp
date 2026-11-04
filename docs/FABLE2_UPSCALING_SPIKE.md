@@ -215,7 +215,7 @@ the exclusions below are on *rates*, not on one surviving or one dying launch.
 
 | arm | what was compiled out / changed | runs | self-exit | survived | time after 1st paint | last-second `WAIT_REG_MEM` |
 |---|---|---|---|---|---|---|
-| A0 | control: prebuilt 0.10.0 DLLs | 1 | 0 | 1 | — (full 80 s timer) | 306/s |
+| A0 | control: prebuilt 0.10.0 DLLs (before the arms, and again after the last one) | 2 | 0 | 2 | — (full 80 s timer ×2) | 306, 294/s |
 | A1 | nothing (patch as committed), bilinear | 1 | 1 | 0 | 18.2 s | 675/s |
 | B | nothing; bisect instrumentation added | 1 | 1 | 0 | 14.4 s | 215/s |
 | C | suspect 2: ffx root signatures + `guest_output_ffx_*` PSOs | 1 | 1 | 0 | 4.3 s | 274/s |
@@ -226,9 +226,9 @@ the exclusions below are on *rates*, not on one surviving or one dying launch.
 | G | `kMaxGuestOutputPaintEffects` forced back to 1 (the non-Fable2 value) | 4 | 4 | 0 | 5.0 / 5.2 / 10.6 / 13.2 s | 227–281/s |
 
 Armed-build total this pass (A1, B, F, F', and the two §7.1 runs): **9 self-exits
-in 10 launches**. Controls in this batch: A0 (prebuilt) and E (option OFF, two
-fresh builds) — both survive the full timer, every time, 3 of 3 including §5's, and
-never logged a self-exit.
+in 10 launches**. Controls: A0 (prebuilt DLLs, run before the first arm and again
+after the last one) and E (option OFF, two fresh builds) — **4 launches, 4
+survivals**, no self-exit in any of them; §5's option-OFF control is a fifth.
 
 ### The three suspects, one at a time
 
