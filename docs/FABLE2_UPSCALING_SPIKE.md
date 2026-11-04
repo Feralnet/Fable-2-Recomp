@@ -1132,8 +1132,9 @@ Basis for the decision:
 - `out/off-detect/` — option-OFF + detector, `86cbcb6d…` (arms O).
 - `out/drawer-detect/batch-results.csv` — one row per launch: arm, rc, wall,
   log, first-paint timestamp, alive-after-paint, chain, detection counts.
-- `out/drawer-detect/detect-{3,6,9,11,13,16,19}.txt` — the detector logs
-  (46 MB-class; `detect-19` carries the pre/post-draw hexdumps of §11.2(c)).
+- `out/drawer-detect/detect-{3,6,9,11,13,16,17,18,19}.txt` — the detector logs,
+  1.9-6.7 MB each (~25 MB total); `detect-19` carries the pre/post-draw hexdumps
+  of §11.2(c), and `detect-17`/`-18` are the option-OFF runs with zero hits.
 - `out/drawer-detect/stdout-24.txt` — the `+seh` trace naming `+0xEC690`.
 - 24 launches, ledger `~/.hermes/logs/game-jobs.jsonl` (051-074).
 - `out/launchcheck/` restored to the option-OFF control pair (`a27a9a5b…`)
