@@ -1472,10 +1472,13 @@ applies cleanly" guard. Nothing was committed to the SDK tree.
 **The armed build is now fit to go on the operator's install, with one caveat
 that is about policy rather than code:** the crash that kept it off is fixed at
 its cause rather than worked around — the corrupting write no longer happens, the
-offset it was writing to is now `guest_vblank_count_` in both builds, and the
-vblank counter the pacer gates on is incremented for the first time in the armed
-build. 7/7 survivals, an instrumented build that shows the byte no longer moving,
-and an FSR chain that still runs.
+offset it was writing to is now `guest_vblank_count_` in both builds, and that
+counter is incremented by the runtime itself (`lock incq 0x1f8`, §12.2(b)) rather
+than never being reached. *(That the counter now increments is a source-and-
+disassembly statement: the pacer diagnostic that would print the rate still does
+not fire under this config, so it was not observed at runtime.)* 7/7 survivals,
+an instrumented build that shows the byte no longer moving, and an FSR chain that
+still runs.
 
 The caveat: the fix lives in an SDK **patch**, not upstream, and the SDK tree
 stays at `cc5f03d` + patch stack — so any rebuild that forgets the patch
