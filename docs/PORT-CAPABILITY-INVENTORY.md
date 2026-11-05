@@ -860,3 +860,80 @@ Values pulled from the source where the default is a choice, not a number.
 | `gpu_plugin` | default `""` |
 | `present_effect` | default `"bilinear"` |
 | `present_effect` | `bilinear`, `cas`, `fsr`, `fsr2`, `fsr3` — **`cas`/`fsr*` are only accepted when the runtime is FSR-armed** |
+
+---
+
+## 13. Which knobs actually WORK, measured — the audit's real payload
+
+An audit that only lists names is worth little; three of tonight's dead ends came from knobs
+that *exist* and do nothing. This section marks the ones that were tested. **A name in the
+source is not a working feature.**
+
+### The perf CSV — 2 of 17 counters are real
+
+`perf_log_csv` / `REX_PERF_LOG_CSV=<path>` **does** work: it wrote 5,721 rows of
+`fable_2.log`-style per-frame CSV. But across the whole capture:
+
+```
+frame_time_us        0 → 42,312      POPULATED
+fps                  0 → 30          POPULATED
+draw_calls               0           flat zero
+vertices_processed       0           flat zero
+command_buffer_stalls    0           flat zero
+xma_frames_decoded       0           flat zero
+functions_dispatched     0           flat zero
+texture_cache_hits/misses             flat zero
+pipeline_cache_hits/misses            flat zero
+active_threads                        flat zero
+```
+
+Why: `PROFILE_DRAW_CALL()` / `PROFILE_VERTICES()` have **2 call sites each, only in
+`src/graphics/d3d12/command_processor.cpp`** — a path this port's Xenos GPU plugin does not
+use. `fps`/`frame_time_us` are populated because they are set directly by `SetCounter` at
+`src/graphics/command_processor.cpp:1055`.
+
+**Consequence: the perf CSV canNOT distinguish an FMV from gameplay.** It was proposed for
+exactly that and it does not do it. Wire the macros into the path actually used, or do not
+rely on it.
+
+### `gpu_debug_markers` — inert for this purpose
+
+Set `true` live, waited, and the log gained **no per-draw names** (`Draw` / `Dispatch` /
+`BeginEvent` all 0 hits). It does not give a per-operation trace here, so it cannot be used to
+count geometry either.
+
+### `present_effect` — real, but read at chain-build time
+
+Accepted `fsr` and `cas` once the runtime was armed, but the paint chain is built **once**
+(`guest output paint:` appears at startup and never again) and the runtime's own string says
+`"Requires restart to take effect"`. **Setting it live changes nothing** — it must be set
+before the chain builds. The effect must be chosen at launch, not toggled during a run.
+
+### `resolution_scale` — name-confusion hazard
+
+The port answers a cvar named `resolution_scale`, but the SDK's actual scaling knobs are
+**`draw_resolution_scale_x` / `draw_resolution_scale_y`**. A null result measured on
+`resolution_scale` is therefore **not** a statement about draw scaling. Identify the real knob
+before concluding anything from a cvar that merely accepts a value.
+
+### Which runtime is armed, and why it matters
+
+`present_effect` accepts `cas`/`fsr*` **only when the runtime is FSR-armed**
+(`REX_HAS_FIDELITYFX_SDK`, gated at `src/ui/presenter.cpp:131`). The armed pair is selected by
+**which `rexruntime.dll` is deployed**, and the SDK keeps one directory per build profile:
+
+| profile | size | armed | built |
+|---|---|---|---|
+| `backup-fsr1-off` | 9,564,160 | no | 12:42 |
+| `fsr-clean` | 9,668,608 | **yes** | 13:26 — **pre-fix, crashes at 34 s** |
+| `off-detect` | 9,597,440 | no | 16:30 |
+| `win-amd64` | 9,672,192 | **yes** | **19:58 — post-fix, survives** |
+
+**`drawer-detect2` has the same byte size as `win-amd64` with a different hash** — match on
+hash, never size. And the crash fix landed at 18:06, so **mtime is the cheap discriminator**
+between an armed runtime that works and one that dies.
+
+Measured on this box, same session: armed **pre-fix** exited 5 after **34 s**; armed
+**post-fix** ran **8 minutes** and was only stopped by a deliberate replacement; the unarmed
+baseline ran 16m34s. That is the layout fix verified in the armed configuration with a live
+control.
