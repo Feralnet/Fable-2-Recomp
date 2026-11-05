@@ -9,9 +9,8 @@ Evidence: `/run/media/feral/Games/Recomp/fable2/docs/FABLE2_UPSCALING_SPIKE.md` 
 
 ## Title
 
-An `inline` accessor in a public header + a `PRIVATE` compile definition that
-changes the class layout = silent cross-module memory corruption when the
-FidelityFX SDK option is enabled
+`PRIVATE` compile definition changes a public class layout — cross-module
+memory corruption when the FidelityFX option is on
 
 ## Summary
 
@@ -73,7 +72,7 @@ A one-line check that does not need a game: compare
 without `REX_HAS_FIDELITYFX_SDK`. Before the fix they differ by 16 bytes; after
 it they are identical.
 
-## The fix that is proposed here (two parts, either alone removes the crash)
+## The fix that is proposed here (two parts, applied and measured together)
 
 1. **Make the layout define-independent.** `GuestOutputPaintConfig`'s FSR
    members (`cas_additional_sharpness_`, `fsr_max_upsampling_passes_`,
@@ -99,6 +98,12 @@ one interleaved 12-launch batch where the pre-fix build **crashed 2 of 2** and
 the option-OFF build survived 3 of 3; the detector reported **0** dead-iterator
 events in 12,954 armed walks, and the byte at the iterator's offset moved **0**
 times across a `Draw()` (it moved 10 times in 12,703 walks before the fix).
+
+**Both parts were applied and measured together.** The reasoning above for why
+each would independently close *this* crash is that (1) makes the two modules
+agree on the layout and (2) removes the baked offset altogether — but the parts
+were **not** measured separately, so that is an argument from the mechanism, not
+a measured result.
 
 ## Why it is worth fixing upstream rather than patching per title
 
