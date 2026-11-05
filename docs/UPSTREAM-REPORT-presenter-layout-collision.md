@@ -1,6 +1,8 @@
-# Upstream report — DRAFT, NOT POSTED
+# Upstream report — POSTED as rexglue/rexglue-sdk#564
 
-**Status: held for Marcus's verbatim audit. Nothing has been sent anywhere.**
+**Status: POSTED 2026-11-05T00:21:30Z as `rexglue/rexglue-sdk#564` — https://github.com/rexglue/rexglue-sdk/issues/564**
+
+Posted bytes verified identical to the audited ones on read-back (body sha256 `79f3b2db2aadfe03c4580b72ab96b7faeb9a6d68432dd69bc30b1fcb7e71901d`, 6658 B, author `Feralnet`, issue open).
 Target: the canonical ReXGlue SDK repository `rexglue/rexglue-sdk` — as an **issue** (its issue tracker is enabled).
 
 **Target correction, found at post time (2026-11-04).** This draft previously named `himdo/rexglue-sdk`. That is a **fork** of the canonical project — it is the repo our game tree's submodule points at, and it has **issues disabled**, so it cannot receive a report. The canonical repo `rexglue/rexglue-sdk` has issues enabled. The Fable II runtime tree is pinned to commit `cc5f03d` from the fork; the defect is in the shared SDK code and is not fork-specific.
