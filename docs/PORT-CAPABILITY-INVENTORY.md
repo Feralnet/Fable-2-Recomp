@@ -1233,3 +1233,47 @@ and the count is a third independent confirmation of the tree identities in §18
   baseline aside to restore the patched tree leaves it on disk. Delete it explicitly, and verify
   the tree afterwards (`602 files`, `rexglue.cmake` present, `default/` intact) rather than assuming
   the restore was clean.
+
+---
+
+## 20. Building a second arm — THE CACHE IS THE RECIPE, not the preset names
+
+A hand-written `cmake` invocation for this port **silently produces a host build** and then dies
+in a way that blames the source:
+
+```
+FAILED: CMakeFiles/fable_2.dir/src/main.cpp.o
+fatal error: Windows.h: No such file or directory      (src/diagnostics/fable2_av_probe.h:39)
+compile line:  /usr/bin/c++ -DFABLE2_BUILD_PROFILE="goty-compatible" ...     ← HOST compiler
+```
+
+The tell is the compiler path. **`/usr/bin/c++` means the toolchain file was not applied**, and
+`Windows.h` is the symptom, not the cause. The build never had a chance to be a Windows build.
+
+**The recipe lives in the working build's `CMakeCache.txt`**
+(`out/build/wincross-relwithdebinfo/CMakeCache.txt`). Copy these, do not reconstruct them:
+
+```
+CMAKE_TOOLCHAIN_FILE          = <repo>/out/toolchain-wincross.cmake     <- the one that matters
+CMAKE_BUILD_TYPE              = RelWithDebInfo
+CMAKE_CXX_FLAGS / C_FLAGS     = -march=x86-64-v2
+FABLE2_BUILD_PROFILE          = goty-compatible
+FABLE2_CODEGEN_TOOL           = <sdk>/out/linux-amd64/rexglue
+FABLE2_NO_PE_CLEAN            = ON
+FABLE2_PROFILER_FRIENDLY      = OFF
+REXGLUE_RECOMP_DEBUG_INFO     = none
+REXGLUE_SDK_ROOT              = <sdk>/win-amd64
+```
+
+`CMakePresets.json` exists and names a `win-amd64-relwithdebinfo` preset, but the working build
+directory is `wincross-*` — so **do not infer the build shape from the preset names**; read the
+cache of a build that works and reproduce its values.
+
+**Why this keeps happening, and the rule that stops it.** This is the third failure in this
+workstream caused by invoking a mechanism by hand rather than using the shape the project already
+uses (the exe-directory CWD in §14, the "anchored" process pattern in §12, this). The rule:
+**when a working artefact exists, its configuration IS the specification — read it and reproduce
+it, and never re-derive a command from what the settings appear to mean.** The corollary is a
+cheap check that would have caught all three: before trusting a build or launch, assert one
+property of the *running* thing (compiler path, working directory, process first token), not the
+fact that the command was accepted.
