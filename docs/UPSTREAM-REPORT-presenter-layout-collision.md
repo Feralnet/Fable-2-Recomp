@@ -1,7 +1,9 @@
 # Upstream report — DRAFT, NOT POSTED
 
 **Status: held for Marcus's verbatim audit. Nothing has been sent anywhere.**
-Target: the ReXGlue SDK repository (`himdo/rexglue-sdk`), as an issue or PR note.
+Target: the canonical ReXGlue SDK repository `rexglue/rexglue-sdk` — as an **issue** (its issue tracker is enabled).
+
+**Target correction, found at post time (2026-11-04).** This draft previously named `himdo/rexglue-sdk`. That is a **fork** of the canonical project — it is the repo our game tree's submodule points at, and it has **issues disabled**, so it cannot receive a report. The canonical repo `rexglue/rexglue-sdk` has issues enabled. The Fable II runtime tree is pinned to commit `cc5f03d` from the fork; the defect is in the shared SDK code and is not fork-specific.
 Author of the draft: Rigsy (agent), for Marcus.
 Evidence: `/run/media/feral/Games/Recomp/fable2/docs/FABLE2_UPSCALING_SPIKE.md` §10–§12.
 
