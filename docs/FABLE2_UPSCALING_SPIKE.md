@@ -1846,6 +1846,12 @@ effect of this card.
   and the two exe builds.
 - Analysis: `~/.hermes/kanban/workspaces/t_3f8bd8f5/{analyze.py, cadence.py,
   codegen-compare.py, run-one.sh, batch.sh, pr/*.diff, arms/*/}`.
+- `out/launchcheck/` — left on the **baseline** pair (`rexgpu-xenos
+  015c5581…`, `rexruntime bff933c5…`) with `fable_2.exe` rebuilt from the
+  restored `generated/` (109,906,944 B); one final confirm launch on that
+  state survived (rc 124, 2,182 frames, `early-woken 0`).
+- The SDK tree is back to the §12 state: `git diff` = 13 files / 731
+  insertions, i.e. exactly the five-patch stack, no PR and no instrument.
 - 39 launches through the lane (24 in the measured batch, 6 + 6 in the two
   cadence passes, one smoke, one #554 exe run, plus 3 cadence runs that
   crashed on a bad half-patched DLL build — §13.12); ledger
