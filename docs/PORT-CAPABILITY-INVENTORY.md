@@ -193,8 +193,33 @@ So: to step *one* item, hold **between ~120 and ~300 ms** and make sure nothing 
 to reach a known end of a list, hold long and then step off it. `get-state` confirms what is
 actually held — check it, because a long hold keeps the button down after the call returns.
 
-**Reliable recipe for "get past the menus into gameplay":** press `A` on the menu (which
-takes *New Game*), then `A` on the gender-select cards.
+**Reliable recipe for "get past the menus into gameplay":** hold a **sticky** `A` — NOT a
+timed press (see the correction below).
+
+**CORRECTION, measured 2026-11-04 ~22:02 — a timed press does not confirm, a sticky hold does.**
+The table above is right about *navigation* and wrong about *confirmation*. Three separate
+`press A --hold 250` calls against the title screen did **nothing** (returned `ok:true`, no
+advance, verified by frame), while a single sticky `state --buttons A` held for 3 s took the
+game off the menu and into its opening (the game's own log then shows
+`[texture-morph] building hero/dog textures in realtime (GPU) mode` and
+`[motion-blur] game requested full-screen motion blur 0.300`). So for a **confirm**, do not
+tune a hold duration — set a sticky baseline, wait, and `clear`:
+
+```bash
+python3 tools/fable2_control.py state --buttons A   # sticky baseline
+sleep 3
+python3 tools/fable2_control.py clear
+```
+
+Open question, not yet measured: whether a *navigation* press at 120-300 ms really works or
+whether those moves were also only visible because a sticky state was outstanding. Re-measure
+before trusting the per-step timing above.
+
+**Do not use the log's `[core]` SDL `OnControllerDeviceAdded` lines to judge whether our pad
+reaches the guest.** Those are the HOST layer (real pads, e.g. an Xbox pad and a Valve
+`0x28DE` device). Our pad is a rexglue `InputDriver` at the emulator's XInput layer
+(`remote_gamepad_driver.h`), registered via `fable_2_app.h:133`, `info.synthetic = true`, and
+it never appears in SDL's list — by design. Its absence there is not evidence of failure.
 
 ### The state classifier is not an oracle here
 
