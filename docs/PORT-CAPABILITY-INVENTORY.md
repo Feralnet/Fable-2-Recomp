@@ -309,20 +309,29 @@ works". Before concluding an input was ignored, confirm nothing else is driving 
 screen that needed a directional input first. The remote pad's focus-independence is real; a
 genuine focus test is `xdotool`, not a supposition.
 
-**Killing and finding the title — the pattern self-matches.** `pkill -f 'fable_2.exe'` matches
-the launcher shell itself, because the pattern appears literally in the command line that
-invokes it: the script kills its own parent, and a "still running" check then reports the
-launcher as if it were the game. Anchoring the pattern does NOT fix it — the launcher's command
-line also contains the exe path *with* a slash, so `[/]fable_2\.exe` still matches it. The
-reliable discriminator is a command line that **starts with** the exe path (the wine process),
-not one that merely contains it:
+**Killing and finding the title — the pattern self-matches, and the "anchored" form matches
+nothing that matters.** `pkill -f 'fable_2.exe'` matches the launcher shell itself, because the
+pattern appears literally in the command line that invokes it: the script kills its own parent,
+and a "still running" check then reports the launcher as if it were the game.
+
+The usual repair — requiring a slash, `[/]fable_2\.exe` — is **worse than useless, and
+backwards**: Wine's command line is a **Windows path with backslashes**
+(`Z:\run\media\…\out\dbg-launch\fable_2.exe`), so a forward-slash-anchored pattern **misses the
+real game entirely** while still matching every launcher shell, whose paths use forward slashes.
+Measured: after a `pkill -f '[/]fable_2\.exe'` the launchers were gone and **the game was still
+running** (`pid 2733740`, cmdline starting `Z:\…\fable_2.exe`).
+
+`pgrep -f 'fable_2'` shows both, so the discriminator is the FIRST TOKEN, not the slash:
 
 ```bash
-pgrep -af 'fable_2\.exe' | grep -vE 'bash|game-job|gpu-job|proton|timeout'   # the game only
+# the game only — its command line STARTS with the Windows path
+pgrep -af 'fable_2' | awk '$2 ~ /^Z:/ || $2 ~ /fable_2\.exe$/'
 ```
 
-Two frames captured a few seconds apart with **different hashes** is the cheap proof that a run
-is live and rendering; a single frame, or two identical hashes, proves nothing.
+A launcher's first token is `/usr/bin/bash` (or `bash`); the title's first token is
+`Z:\…\fable_2.exe`. Two frames captured a few seconds apart with **different hashes** is the
+cheap proof that a run is live and rendering; a single frame, or two identical hashes, proves
+nothing.
 
 ### The state classifier is not an oracle here
 
