@@ -1,0 +1,199 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 33a72e9..a2e6b00 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -89,6 +89,10 @@ class CommandProcessor {
+   uint32_t counter() const { return counter_; }
+   void increment_counter() { counter_++; }
+ 
++  // Wakes a WAIT_REG_MEM poll sleeping on the command processor thread, so it re-checks its
++  // condition now instead of at the end of its poll interval. Called after each guest vblank.
++  void WakeRegisterWaits() { register_wait_wake_event_->Set(); }
++
+   Shader* active_vertex_shader() const { return active_vertex_shader_; }
+   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+ 
+@@ -260,6 +264,7 @@ class CommandProcessor {
+   uint32_t read_ptr_writeback_ptr_ = 0;
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
++  std::unique_ptr<rex::thread::Event> register_wait_wake_event_;
+   std::atomic<uint32_t> write_ptr_index_;
+ 
+   // Some titles submit writes beyond the emulated register file range in PM4
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index dcbcbbc..3aeb93a 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -152,8 +152,10 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
+       register_file_(graphics_system_->register_file()),
+       worker_running_(true),
+       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
++      register_wait_wake_event_(rex::thread::Event::CreateAutoResetEvent(false)),
+       write_ptr_index_(0) {
+   assert_not_null(write_ptr_index_event_);
++  assert_not_null(register_wait_wake_event_);
+ }
+ 
+ CommandProcessor::~CommandProcessor() = default;
+@@ -193,6 +195,9 @@ bool CommandProcessor::Initialize() {
+ void CommandProcessor::Shutdown() {
+   worker_running_ = false;
+   write_ptr_index_event_->Set();
++  // Vblanks have stopped by now (GraphicsSystem::Shutdown stops them first), so wake a
++  // WAIT_REG_MEM poll instead of letting it sleep out its interval.
++  register_wait_wake_event_->Set();
+   worker_thread_->Wait(0, 0, 0, nullptr);
+   worker_thread_.reset();
+ }
+@@ -1177,7 +1182,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+         } else {
+-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          // Woken early by the guest vblank (WakeRegisterWaits): the polled value is often
++          // written by the vblank interrupt, and a plain Sleep wakes 0.5-3 ms after it.
++          rex::thread::Wait(register_wait_wake_event_.get(), false,
++                            std::chrono::milliseconds(wait / 0x100));
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();
+@@ -1188,6 +1196,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         }
+       } else {
+         rex::thread::MaybeYield();
++        if (!worker_running_) {
++          // A value the vblank interrupt writes never changes once vblanks stop at shutdown.
++          return false;
++        }
+       }
+     }
+   } while (!matched);
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 6d09240..67a9398 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -24,6 +24,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xthread.h>
+@@ -31,6 +32,16 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#if REX_PLATFORM_WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -164,17 +175,60 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++#if REX_PLATFORM_WIN32
++        // Upstream PR #558 (fixes #556). Measured here: guest vblank jitter 1,188 us -> 7 us,
++        // no fps change (the guest frame limiter pins the title at 30 fps regardless).
++        // Wait for each vblank deadline on a high-resolution waitable timer and spin the last
++        // stretch. Polling with Sleep(1) fires every vblank 1-2 ms late at 1 ms timer resolution,
++        // and on 15.6 ms steps at the default resolution (vblanks then arrive 15.6 / 31 ms apart).
++        HANDLE vblank_timer = CreateWaitableTimerExW(
++            nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++        constexpr uint64_t kSpinUs = 500;
++        if (!vblank_timer) {
++          REXGPU_WARN("GPU VSync: no high-resolution timer ({}), polling with Sleep(1)",
++                      GetLastError());
++        }
++#endif
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+-          uint64_t interval_ticks =
+-              (REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_pacing))
+-                  ? vsync_interval_ticks : no_vsync_interval_ticks;
++          // Local: guest_vblank_pacing gates the 60 Hz vblank tick (vsync alone would pace it).
++          bool vsync = REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_pacing);
++          uint64_t interval_ticks = vsync ? vsync_interval_ticks : no_vsync_interval_ticks;
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
+             last_frame_time += interval_ticks;
+           }
++#if REX_PLATFORM_WIN32
++          if (vblank_timer) {
++            uint64_t remaining_ticks =
++                last_frame_time + interval_ticks - chrono::Clock::QueryGuestTickCount();
++            if (int64_t(remaining_ticks) <= 0) {
++              continue;
++            }
++            uint64_t remaining_us = remaining_ticks * 1000000 / guest_tick_frequency;
++            // Spin only before a vsync vblank; the 1 ms no-vsync tick is not worth a core.
++            uint64_t spin_us = vsync ? kSpinUs : 0;
++            if (remaining_us > spin_us) {
++              LARGE_INTEGER due;
++              // Relative due time, in 100 ns units.
++              due.QuadPart = -int64_t((remaining_us - spin_us) * 10);
++              if (SetWaitableTimerEx(vblank_timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
++                WaitForSingleObject(vblank_timer, INFINITE);
++                continue;
++              }
++            } else {
++              YieldProcessor();
++              continue;
++            }
++          }
++#endif
+           rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
++#if REX_PLATFORM_WIN32
++        if (vblank_timer) {
++          CloseHandle(vblank_timer);
++        }
++#endif
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+@@ -186,17 +240,18 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+ }
+ 
+ void GraphicsSystem::Shutdown() {
+-  if (command_processor_) {
+-    command_processor_->Shutdown();
+-    command_processor_.reset();
+-  }
+-
++  // Stop the vblank thread first: MarkVblank uses command_processor_.
+   if (vsync_worker_thread_) {
+     vsync_worker_running_ = false;
+     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+     vsync_worker_thread_.reset();
+   }
+ 
++  if (command_processor_) {
++    command_processor_->Shutdown();
++    command_processor_.reset();
++  }
++
+   if (presenter_) {
+     if (app_context_) {
+       app_context_->CallInUIThreadSynchronous([this]() { presenter_.reset(); });
+@@ -343,6 +398,10 @@ void GraphicsSystem::MarkVblank() {
+   //     something wrong and the CP will block waiting for code that
+   //     needs to be run in the interrupt.
+   DispatchInterruptCallback(0, 2);
++
++  if (command_processor_) {
++    command_processor_->WakeRegisterWaits();
++  }
+ }
+ 
+ void GraphicsSystem::ClearCaches() {

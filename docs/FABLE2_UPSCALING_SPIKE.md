@@ -1518,3 +1518,333 @@ which is the mitigation.
 - 12 launches, logs `out/launchcheck/logs/fable_2_075..086.log`, ledger
   `~/.hermes/logs/game-jobs.jsonl` (the 12 most recent Fable II rows).
 - `out/launchcheck/` restored to the option-OFF control pair after the batch.
+
+## 13. Upstream-PR pass (kanban `t_3f8bd8f5`) — five candidate PRs measured; one adopted, three declined, one adopted-with-a-condition
+
+Five open `rexglue/rexglue-sdk` PRs whose bug descriptions match signatures
+this port has actually logged. Two were nominated for a perf measurement
+(`#558` / `#559`), three as silent-correctness risks (`#554` / `#538` /
+`#531`). Nothing was posted upstream and the submodule pin was not moved.
+
+The headline, before the detail: **only one of the five produces a
+measurable change in our build, and it is not the one we hoped for.** `#558`
+turns the guest vblank from a ~1.2 ms-jitter Poll into a 16.665 ms ±7 µs
+deadline — a real, 150× improvement in the thing it claims to fix — and
+still moves frame time by nothing, because the *guest's own* frame limiter
+pins the title at 30 fps. `#554` changes the recompiler's output for this
+title by **+222 functions**, which is a silent-correctness result, not a
+perf one. `#559`, `#538` and `#531` are measurably inert here; `#559` is
+actively undesirable.
+
+### 13.1 Method
+
+Every arm is a **plugin DLL pair** (`rexgpu-xenos.dll` + `rexruntime.dll`)
+built from the SDK tree at our pinned `cc5f03d` **with the existing five-patch
+stack already applied**, so the arm differs from the control only by the PR:
+
+| arm | DLL `rexgpu-xenos` sha256 (first 12) | what it is |
+|---|---|---|
+| CTL | `2988f9ef6f2b` | pinned tree + the measurement instrument below |
+| P558 | `3f069427c88e` | CTL + PR #558 |
+| P559 | `664fec68f2ab` | CTL + PR #559 |
+
+Launched through the lane (`game-job.sh --on DP-1 --gpu-wait 0`, window never
+activated, audio muted, 75 s inner timeout, `REX_PRESENT_EFFECT=bilinear`),
+the same scene, the same save, the same Proton toolchain. **24 launches in
+6 batches of 4**: each batch ran a control first and a control last, and the
+two fix arms alternated order between batches, so drift cannot correlate
+with an arm. 12 control runs, 6 per fix arm.
+
+`--gpu-wait 0` means the GPU gate was skipped (its own verdict was `busy`:
+free VRAM 3.2-4.1 GB against a 6.1 GB reservation — the resident `qwen3-tts`
+server holds 4,946 MiB). **Free VRAM was equal across all arms within a
+batch** (ledger `pre_free_vram_mb` recorded per run in
+`out/pr-eval/runs.csv`); the absolute level is lower than §12's 8.5 GB
+because the desktop's own VRAM use is higher tonight, not because an arm
+changed it.
+
+### 13.2 The instrument, and why the existing log line was not enough
+
+The tree already logs, once a second:
+
+```
+WAIT_REG_MEM long-waits: 237 in 1000 ms (~237.0/s, total sleep 237 ms/s, vsync=1)
+```
+
+**That number is the sleep the code *asked for*, not the time it actually
+blocked** (`diag_sleep_ms += wait / 0x100`). A fix whose entire point is that
+the poll now returns early would barely move it. So two temporary
+instruments were added for this pass only:
+
+1. `WAIT_REG_MEM … [actual N ms/s, early-woken M]` — wall time around the
+   wait (`steady_clock` either side) and the count of waits that returned
+   before their requested interval. On the **control this must read
+   `early-woken 0`** — it does, in all 18 instrumented control runs, which is
+   the check that the probe is alive rather than dead.
+2. `vblank cadence: N in 1000 ms (mean X us, min Y us, max Z us)` — interval
+   statistics of the actual `MarkVblank()` dispatch, i.e. the thing #558's
+   high-resolution timer is supposed to regularise.
+
+Frame timing comes from the SDK's perf CSV (`REX_PERF_LOG_CSV`,
+`frame_time_us`/`fps` per guest swap); one CSV per launch in
+`out/pr-eval/csv/`.
+
+### 13.3 #558 (fixes #556) — the vblank deadline tightens 150×, and nothing else moves
+
+Patch content: a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` waitable timer for
+the vblank thread with a 0.5 ms spin before each vsync deadline; WAIT_REG_MEM
+polls wait on an auto-reset event that `MarkVblank()` sets; `Shutdown` joins
+the vblank thread before the command processor.
+
+**Apply:** the PR applies to `development`, not to our tree — it conflicted in
+`graphics_system.cpp` (2 rejects) and in the instrumented
+`command_processor.cpp`. Resolved by hand, and the one real semantic
+difference is recorded: our tree gates the 60 Hz tick on
+`vsync && guest_vblank_pacing`, the PR gates it on `vsync` alone, so the
+reconciled line keeps our cvar and adopts the PR's structure:
+
+```cpp
+bool vsync = REXCVAR_GET(vsync) && REXCVAR_GET(guest_vblank_pacing);
+uint64_t interval_ticks = vsync ? vsync_interval_ticks : no_vsync_interval_ticks;
+```
+
+Everything else is the PR as authored. Confirmed live in the binary
+(`strings`: `GPU VSync: no high-resolution timer` is present, and it does
+**not** appear in any P558 log — so `CreateWaitableTimerExW` with
+`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` *succeeds under Proton/Wine*, and the
+`Sleep(1)` fallback is not what we measured).
+
+Measured, 6 runs vs 12 controls (median of per-run steady-state medians):
+
+| metric | CTL | P558 | delta |
+|---|---|---|---|
+| `WAIT_REG_MEM` long-waits/s | 906 | 980 | +8 % (more polls, see below) |
+| requested sleep, ms/s | 906 | 981 | +8 % |
+| **actual blocked, ms/s** | **954** | **955** | **none** |
+| waits woken early per run | 0 | 3,850 (~58/s) | one per vblank, as designed |
+| frame time median | 33,346 µs | 33,332 µs | −0.04 % |
+| fps median | 29.99 | 30.00 | none |
+| frame p99 / worst | 41,078 / 43,002 µs | 41,028 / 44,952 µs | none |
+| frames per 75 s run | 2,165 | 2,173 | +0.4 % |
+| survived | 12/12 | 6/6 | — |
+
+The wake mechanism works exactly as designed — ~58 early wakes/s is one per
+vblank — but it converts almost none of the sleep, because at ~900 polls/s
+the CP thread is already re-checking every ~1.1 ms: a vblank finds a poll
+asleep most of the time, and waking *one* poll early per vblank only shifts
+~60 of 900 iterations. The +8 % poll rate is the same effect seen from the
+other side (an early return re-enters the loop sooner).
+
+**The real difference is the one #556 is named for.** Vblank cadence,
+5 runs per arm, 284 vs 357 steady-state one-second windows:
+
+| | CTL (`Sleep(1)` polling) | P558 (hi-res timer) |
+|---|---|---|
+| interval mean | 16,665 µs | 16,665 µs |
+| per-window min / max (median) | 15,776 / 16,954 µs | 16,658 / 16,667 µs |
+| **jitter (max−min)** | **~1,180 µs** | **~7 µs** |
+| windows with a >20 ms gap | 2 / 284 | 0 / 357 |
+| worst single window max | 23,052 µs | 19,839 µs |
+
+So: **#558 is a win, and it is precisely the win it advertises** — the guest
+vblank stops being 1-2 ms late and lands within a few µs of 16.667 ms, with
+no missed deadline in 357 seconds. It just cannot show up as fps, because
+`FrameLimiterWait_82242628` and the guest's own WAIT_REG_MEM pacing hold the
+title at 30 fps (§FPS_CAP_INVESTIGATION): the frame limiter does not care
+whether the vblank it waits for is 1.2 ms early or 7 µs early. A tighter
+vblank is a *precondition* for 60 fps work, not a 30 fps optimisation.
+
+Cost: the 0.5 ms spin before each vsync deadline is ~3 % of one core
+(0.5/16.7); the timer also removes ~940 sleep-wakeups/s from the vblank
+thread. Neither is visible in frame timing.
+
+**Verdict: adopt**, as `thirdparty/rexglue-sdk-vblank-timer.patch` — with the
+caveat stated in the patch header that its measured benefit is vblank
+precision, and that the fps benefit is deferred until the guest limiter is
+addressed.
+
+### 13.4 #559 (fixes #557) — applies, and has nothing to remove here
+
+The PR stops `PipelineCache::EndSubmission` waiting for pipelines while
+`async_shader_compilation` is on, and makes `IssueDraw` skip a draw whose
+pipeline is not created yet.
+
+**Our tree already has a different fix for the same bug.** At
+`src/graphics/d3d12/command_processor.cpp` the pinned tree carries a local
+`async_pipeline_wait` cvar (default **true**, timeout 5000 ms) that *waits*
+for the pipeline instead of skipping the draw, with this comment:
+
+> Skipping the draw leaves objects missing for that frame and corrupts any
+> texture rendered by the skipped pass, so wait for the pipeline instead.
+
+That is the same trade, decided the other way — so adopting #559 is not
+"adding a fix", it is **reversing a deliberate local decision**. It was
+applied as authored (the local wait block replaced), which is what an
+adoption would actually ship.
+
+Measured (6 runs vs 12 controls): `WAIT_REG_MEM` 893/s vs 906/s, actual
+blocked 952 vs 954 ms/s, frame median 33,346 µs both, **p99 41,082 vs
+41,078 µs, worst frame 42,336 vs 43,002 µs**, 0 frames over 50 ms in either
+arm, 6/6 vs 12/12 survived.
+
+There is no stall to remove: the title never waits on a pipeline in these
+runs (the pipeline was created on first use long before the 75 s window, and
+the shader/pipeline cache is warm). The author's own measurement was on an
+**empty shader cache**; ours is not, so the 187 ms → 6 ms result is not
+reproducible here — and a cold-cache arm would change every other metric in
+the same run, which is why it was not run inside this batch.
+
+**Verdict: do not carry.** It removes a guard we added for a reason, shows no
+measurable gain, and its own PR body notes the Vulkan `EndSubmission` has the
+same wait left unfixed — so it would move D3D12 and Vulkan out of step.
+
+### 13.5 #554 (fixes #552) — this one changes our recompilation
+
+GapFill stopped at a segment whose start was already a function, which is
+what a function ending in an indirect `bctr` tail call produces — so all the
+code after such a function was never discovered, never recompiled, and
+silently executed as something else.
+
+**Apply:** clean, no conflicts (`phase_discover.cpp`, `phase_gapfill.cpp`,
+`phase_helpers.h`). Codegen is host-side, so this was measured directly: a
+Linux `rexglue` built from the same tree at `cc5f03d`, run twice on the same
+`default.xex` + manifest, once unpatched and once patched, into two scratch
+project roots (`out/pr-eval/codegen/{base,patched}`).
+
+| | baseline | +PR554 |
+|---|---|---|
+| guest functions recompiled | 61,008 | **61,225** |
+| added | — | **222** |
+| removed | — | 5 |
+
+All 222 additions are new `sub_XXXXXXXX` (gap-fill authority) functions; the
+5 removals are gap functions that the new pass absorbed into a real function
+(the PR's own `cleanupAbsorbedGapFills` change). Full list:
+`out/pr-eval/codegen-function-diff.txt`.
+
+Then the stronger test: the patched `generated/default` was swapped into the
+tree, the recomp patches re-applied, and `fable_2` rebuilt — **build exit 0**,
+no missing anchors, new `fable_2.exe` 109,936,128 B (vs 109,905,920 B
+baseline) — and launched once through the lane: survived (rc 124, 2,104
+frames, `WAIT_REG_MEM` 908/s, frame median 33,348 µs, p99 41,038 µs), i.e.
+**identical in behaviour to the control** while recompiling 222 more
+functions.
+
+That is the expected shape for a correctness fix: no metric moves, because
+the code that was previously *not running* is now running correctly rather
+than faster.
+
+**Verdict: adopt** — but it is not a drop-in patch. Unlike the DLL patches it
+requires regenerating `generated/` (309 MB, 600 files) and rebuilding the
+exe; that is a `feral/dlss` commit of its own, with the regenerated tree
+committed or rebuilt at package time. Recorded here as a recommendation, not
+performed as part of this card.
+
+### 13.6 #538 (fixes #537) — applies, and compiles to the same instructions
+
+The bug is real and is a hang generator: `clock_cast<steady_clock>` from an NT
+absolute time near 1601 overflows and the timer never fires. The fix clamps
+the delta to ±100 years.
+
+**It cannot fire in our build.** The only two call sites of the conversion,
+`clock_cast<GClock_>` on an NT time point, are
+`src/core/threading_posix.cpp:1318` and `:1332` — a file whose first
+statement is `static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This
+file is POSIX-only")`. On Win32, `XTimer` holds a
+`WinSystemClock::time_point due_tp` and `SetOnceAt` takes that overload
+directly; the steady conversion never runs.
+
+Proven two ways rather than argued:
+
+- **Build-system:** `build/build.ninja` contains 0 references to
+  `threading_posix.cpp` and 4 to `threading_win.cpp`.
+- **Instruction-level:** applied the patch, rebuilt both DLLs, disassembled
+  both arms (`llvm-objdump -d --no-show-raw-insn`, addresses normalised) and
+  diffed the instruction streams: **identical** — 1,689,808 normalised lines
+  of `rexruntime` and 312,292 of `rexgpu-xenos`, no difference but the
+  filename header. (File hashes are *not* usable for this: two builds of the
+  same source differ — link non-determinism — which is why the comparison is
+  at instruction level.)
+
+**Verdict: do not carry** for the Windows/Proton build. It becomes relevant
+only if this port is ever built natively for Linux — and the SDK does have a
+Linux build (`build-linux`, used for the host codegen tool), so this is worth
+re-checking if a native-Linux runtime is ever shipped. Carrying an unexercised
+patch here would be maintenance cost for no proven gain.
+
+### 13.7 #531 (POSIX event lost wakeups) — applies, and the build does not even rebuild
+
+Applied cleanly to `src/core/threading_posix.cpp`. `ninja` then reported
+**`no work to do`** — the changed translation unit is not in the Windows
+build's dependency graph at all, so not one object was recompiled. There is
+nothing observable to test: a Windows-under-Proton build never links this
+file.
+
+**Verdict: do not carry.** Same class as #538: a Linux-host-relevant fix,
+inert for the shipped binary.
+
+### 13.8 The submodule pin — note, not acted on
+
+Our pin is `cc5f03d` (fork `himdo/rexglue-sdk`, 2026-10-21); upstream `main`
+is `c94f5ebd` and `development` is `bd833a2a`. Worth considering **later**, on
+its own card, because:
+
+- every PR evaluated here targets `development` or `main` and had to be
+  hand-reconciled against our five-patch stack — that rebasing cost grows with
+  every patch we add, and #558 already needed a manual resolution;
+- our fork's `cc5f03d` already carries local work (the `async_pipeline_wait`
+  cvar, the WAIT_REG_MEM diagnostic) that is ours to maintain;
+- **against moving it:** the whole §11/§12 repair is verified against this
+  exact tree, the five patches are proven to reproduce it byte-for-byte, and a
+  pin move invalidates that verification and re-opens the layout-collision
+  surface (the layout invariant fix is in *our* patch, not upstream).
+
+The trade is: a pin move buys the upstream fixes we *would* otherwise carry as
+patches, at the cost of re-verifying the crash fix and the FSR path against a
+new tree — a full re-run of §12's acceptance, not a merge. Recommend doing it
+once, deliberately, after #554's regeneration is committed, not as a side
+effect of this card.
+
+### 13.9 What to do with this
+
+| PR | applies? | measured effect | recommendation |
+|---|---|---|---|
+| **#558** | yes, 2 hand-resolved conflicts | vblank jitter 1,188 µs → 7 µs; fps unchanged | **carry** — patch written |
+| **#559** | yes, 1 hand-resolved conflict (reverses our local wait) | none measurable; removes a deliberate guard | **do not carry** |
+| **#554** | clean | +222 functions recompiled; builds; runs identically | **adopt**, requires regeneration + rebuild |
+| **#538** | clean | instruction-identical build | **do not carry** (POSIX-only path) |
+| **#531** | clean | build does not recompile; not linked | **do not carry** (POSIX-only path) |
+
+### 13.10 Instrumentation disposition
+
+- The `[pr-eval temp]` blocks — actual-blocked-time/early-woken in
+  `src/graphics/command_processor.cpp`, and the vblank-cadence counter in
+  `src/graphics/graphics_system.cpp` — are **not** in the written patch and
+  are **not** in the tree: the SDK tree was restored to the §12 state and
+  verified (`git diff` = the same 13 files / 731 insertions).
+- `thirdparty/rexglue-sdk-vblank-timer.patch` contains only #558 plus the
+  `guest_vblank_pacing` reconciliation. It is applied onto the pinned commit
+  **after** the existing five patches and was verified to apply there.
+- The pre-existing `WAIT_REG_MEM long-waits` diagnostic (already in the pin)
+  stays as it is; the counters it prints are requested-sleep only, which is
+  why it under-reports a wake-based fix by design.
+
+### 13.11 Artefacts
+
+- `out/pr-eval/runs.csv` — one row per launch (arm, run, DLL hash, rc, wall,
+  free VRAM before/after, CSV rows, last-second line), 24 rows.
+- `out/pr-eval/logs/{ctl,p558,p559}-NN.log`, `out/pr-eval/csv/*.csv` — the
+  per-run logs and perf CSVs behind §13.3/13.4.
+- `out/pr-eval/logs/{ctl3,p558c}-NN.log` — the 10 vblank-cadence runs (§13.3
+  second table).
+- `out/pr-eval/codegen/{base,patched}/` — the two codegen outputs;
+  `codegen-function-diff.txt` is the 222/5 function diff.
+- `out/pr-eval/generated-baseline-backup/` — the pre-#554 `generated/default`
+  (restored; the tree's generated code is the baseline again).
+- `out/pr-eval/codegen-base.log`, `codegen-patched.log`,
+  `fable2-554-build.log`, `fable2-restore-build.log` — the two codegen runs
+  and the two exe builds.
+- Analysis: `~/.hermes/kanban/workspaces/t_3f8bd8f5/{analyze.py, cadence.py,
+  codegen-compare.py, run-one.sh, batch.sh, pr/*.diff, arms/*/}`.
+- 34 launches total through the lane; ledger `~/.hermes/logs/game-jobs.jsonl`
+  (the most recent Fable II rows).
