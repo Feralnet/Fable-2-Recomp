@@ -1130,3 +1130,54 @@ to resolve through the scaled path, which is a port/code change rather than a se
 rounds of frame comparison could not. When a visual setting appears inert, look for a line that
 reports the setting's own state before concluding from pixels — the port said "enabled" while the
 image said "nothing", and both were true.
+
+---
+
+## 18. The deployed build ALREADY CARRIES #554 — measured, and it reframes earlier caveats
+
+Card `t_6847d4fd` was written around this premise: *"Every verification we have done on this
+port so far was done on a build missing 222 functions."* **That premise is false for the recent
+work, and it was established by measurement, not by reading dates.**
+
+### How it was established
+
+Three independent checks, all on the artefacts on disk:
+
+1. **The generated tree is the patched one.** Of the diff's 222 *added* function names, **222/222
+   are present** in `generated/` as **definitions** (`DEFINE_REX_FUNC(sub_XXXXXXXX)`) with address
+   table entries (`{ 0xXXXXXXXX, sub_XXXXXXXX }`) — not merely as references. Of the 5 *removed*
+   names, **0/5** are present. That combination is a signature.
+
+2. **The deployed executable is the patched one.** The generated init table stores each function's
+   guest address as a little-endian 32-bit value, so the address list can be searched for in the
+   binary. The deployed `out/dbg-launch/fable_2.exe` contains **222/222** of the added addresses.
+
+3. **A false-positive control exists.** The known-baseline `wincross-release-v2` build contains
+   only **27/222** — that is the chance floor for a 4-byte pattern in a 110 MB binary (~12%), and
+   it is what "absent" looks like. The `release-v2r` eval build scores 222/222. So the test
+   separates the arms cleanly rather than merely reporting "some".
+
+### What this changes
+
+- **The FSR1 gameplay measurement (§15), the crash-fix rates, and the remote-control walk were all
+  taken on a build containing the 222 functions.** They are not "missing-codegen" results, and any
+  write-up that caveats them that way is now wrong.
+- **The regeneration is already done and in place** — `generated/` needs no work for this card.
+- `out/pr-eval/generated-baseline-backup/` holds the unpatched tree, so the before arm is
+  reproducible.
+
+### What is still genuinely missing for a before/after behaviour comparison
+
+**A baseline arm that the control channel can drive.** The remote channel is compiled only in
+`Debug` / `RelWithDebInfo` (see §1), and the available baseline exe is a **Release** build — so the
+"before" arm cannot be walked into gameplay as things stand. The missing piece is a
+**RelWithDebInfo build against `generated-baseline-backup`**, which is a tree swap plus a build,
+not a regeneration. Then both arms can be driven through the same walk (§12) and compared on the
+same scene — the comparison the card actually wants.
+
+### Method note
+
+The address-table search is worth reusing: when a build's provenance is in doubt, search the
+binary for a value the generator emitted, and **always run the same search against a known-absent
+build to get the chance floor.** Without the 27/222 control, an "N found" figure proves nothing in
+a file that large.
