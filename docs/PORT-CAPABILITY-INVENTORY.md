@@ -278,6 +278,37 @@ signature of an FMV cutting between shots.
 *mentions* a title launch (including one embedded in a heredoc while writing documentation) is
 refused as an out-of-lane exec. Write docs with a file tool, not a shell heredoc.
 
+---
+
+## 12. The verified walk into gameplay — MEASURED 2026-11-04 22:2x
+
+Repeatable, driven solo with nothing else touching the pad, no human input, no keyboard. Every
+step is a **sticky hold** (`state`, wait, `clear`) — never a timed `press`:
+
+| screen | action | result |
+|---|---|---|
+| title / press-Ⓐ | sticky `A` ~3 s | main menu |
+| main menu (`New Game` has the Ⓐ prompt) | sticky `A` ~3 s | **character select** (two hero cards) |
+| character select | **sticky `Right` ~1 s** | focus moves onto a card |
+| character select | sticky `A` ~4 s | **in the game** |
+
+**The step that is easy to miss, and cost hours: the character-select screen ignores a confirm
+until focus has been moved onto a card.** Holding `A` there does nothing at all; `Right` first,
+then `A`, goes straight through. Screenshotting between steps is what revealed it — the screen
+looked "stuck" while actually waiting for a directional input.
+
+**Proof it is live gameplay and not a still:** five frames captured 15 s apart have five
+distinct MD5s (a still would be byte-identical) and `avg_luma` swung 66 → 166 → 122 → 88 → 75.
+
+**One driver at a time.** Two processes issuing `state`/`clear` against the same channel fight
+over the single sticky baseline and cancel each other — the symptom is input that "sometimes
+works". Before concluding an input was ignored, confirm nothing else is driving the pad.
+
+**Focus is NOT required.** Measured directly: with the window confirmed active
+(`xdotool getactivewindow getwindowname` → the title), a sticky `A` still did not advance a
+screen that needed a directional input first. The remote pad's focus-independence is real; a
+genuine focus test is `xdotool`, not a supposition.
+
 ### The state classifier is not an oracle here
 
 `fable2_control.py game-state` (documented states: `PreMainMenu` / `PressAScreen` /
