@@ -1181,3 +1181,55 @@ The address-table search is worth reusing: when a build's provenance is in doubt
 binary for a value the generator emitted, and **always run the same search against a known-absent
 build to get the chance floor.** Without the 27/222 control, an "N found" figure proves nothing in
 a file that large.
+
+---
+
+## 19. Installing the baseline tree — the backup is codegen OUTPUT, not a deployable tree
+
+Recorded because the first attempt failed in a way that looks like a broken backup but is a
+**layout mismatch**, and the error names neither.
+
+### The two shapes
+
+| | `generated/` (deployable) | `out/pr-eval/generated-baseline-backup/` |
+|---|---|---|
+| glue | `rexglue.cmake` **present** | **absent** |
+| codegen files | under `default/` | **flat at the backup root** |
+| `default/` subdir | yes (601 files) | **no** |
+
+Installing the backup as `generated/` therefore fails configure with:
+
+```
+CMake Error at CMakeLists.txt:34 (include):
+  include could not find requested file:  generated/rexglue.cmake
+CMake Error at CMakeLists.txt:105 (rexglue_setup_target):
+  Unknown CMake command "rexglue_setup_target".
+```
+
+**Neither message mentions the real problem.** The backup is not incomplete — it is a copy of the
+codegen output's *contents*, and `rexglue.cmake` is not part of that output.
+
+### The correct procedure
+
+**Keep the working tree's `rexglue.cmake`; replace only the contents of `default/`:**
+
+1. `mv generated/default generated/default-patched-save`
+2. `mkdir generated/default && cp -a <backup>/. generated/default/`
+3. configure + build
+4. restore `default/` from the save (trap on exit)
+
+### The backup does hold the baseline — verified before use
+
+`DEFINE_REX_FUNC(sub_XXXXXXXX)` sites: **current `default/` 55,684 vs backup 55,467**. The
+difference, **217, equals the diff's 222 added − 5 absorbed** — so the backup is the unpatched tree,
+and the count is a third independent confirmation of the tree identities in §18.
+
+### Safety notes
+
+- Always **preflight the direction** (the baseline must define *fewer* functions) and abort if not,
+  rather than swapping on faith.
+- Always **restore via a `trap`**, and make the restore idempotent.
+- The first attempt left a **309 MB** `generated.baseline-built` directory behind: moving the
+  baseline aside to restore the patched tree leaves it on disk. Delete it explicitly, and verify
+  the tree afterwards (`602 files`, `rexglue.cmake` present, `default/` intact) rather than assuming
+  the restore was clean.
