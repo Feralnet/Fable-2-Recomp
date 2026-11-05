@@ -1277,3 +1277,44 @@ it, and never re-derive a command from what the settings appear to mean.** The c
 cheap check that would have caught all three: before trusting a build or launch, assert one
 property of the *running* thing (compiler path, working directory, process first token), not the
 fact that the command was accepted.
+
+---
+
+## 21. A stale build directory defeats the toolchain — and `configure exit: 0` will not tell you
+
+The third attempt at the baseline arm passed the toolchain file and **still** built with the host
+compiler, because the build directory already existed from the previous attempt:
+
+```
+out/build/wincross-relwithdebinfo-baseline/CMakeCache.txt
+  CMAKE_CXX_COMPILER   = /usr/bin/c++                                      <- cached, and KEPT
+  CMAKE_TOOLCHAIN_FILE = .../out/toolchain-wincross.cmake                  <- registered, ignored
+```
+
+**CMake does not replace a compiler already in the cache when the toolchain file changes.** The
+new setting is recorded (as `UNINITIALIZED`), **configure exits 0**, and the build then fails on
+`#include <Windows.h>` — blaming the source for a build-shape problem, exactly as in §20.
+
+**Fix: remove the build directory so configure starts fresh.** A build directory created by any
+earlier attempt is contaminated for every later attempt, and `configure exit: 0` is not evidence
+of anything.
+
+### The check that catches it, in the order that matters
+
+1. **In the cache**, immediately after configure:
+   `grep CMAKE_CXX_COMPILER: <builddir>/CMakeCache.txt` — it must not be `/usr/bin/c++`.
+2. **In the build log**, on failure: the compile line. `/usr/bin/c++` means the toolchain did not
+   apply; `Windows.h` is the symptom.
+3. Only then read the actual compiler error — otherwise you debug the source for a configuration
+   fault.
+
+The script for this arm now prints the compiler path straight after configure, and that is the
+only reason this failure was diagnosed in one step instead of several. **Add that assertion to any
+script you write for a second build arm** — it is one line and it converts a confusing source error
+into a one-word answer.
+
+### Family count
+
+§14 (working directory), §12 (process-first-token), §20 (cache-as-recipe), §21 (stale cache): four
+failures with the same shape — **a mechanism invoked by hand, without asserting a property of the
+result.** Each one produced an error message that pointed somewhere other than the cause.
