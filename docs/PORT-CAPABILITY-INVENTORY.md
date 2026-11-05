@@ -937,3 +937,45 @@ Measured on this box, same session: armed **pre-fix** exited 5 after **34 s**; a
 **post-fix** ran **8 minutes** and was only stopped by a deliberate replacement; the unarmed
 baseline ran 16m34s. That is the layout fix verified in the armed configuration with a live
 control.
+
+---
+
+## 14. The working launch shape — and the CWD trap that produces a silent no-log death
+
+**`cd`ing into the exe's directory before launching kills the run silently.** Measured 2026-11-04:
+launching with `cd out/dbg-launch` as the working directory produced **no `fable_2_0NN.log` at
+all**, no control channel, and no perf CSV — the process vanished without the emulator writing a
+single line, which reads exactly like a lane, gate or VRAM fault. It was none of those: the lane
+reported `launchable: true`, `lane_held: false`, `gpu: safe 8762 MB free`, marker valid.
+
+Relaunched with the **identical env and identical command** from the repository root, it came up
+in ~18 s, wrote `fable_2_009.log`, opened the perf CSV, and answered the control channel. The
+working directory was the only difference.
+
+**Launch from the repo root** (or wherever the lane's ledger expects). The motivation for `cd`ing
+in — getting the runtime's own outputs into the dump directory — is not needed for the FSR work:
+the perf CSV is placed by `REX_PERF_LOG_CSV=<absolute path>`, which works regardless of CWD.
+
+### A launch that works has all four of these
+
+Check them in this order; the first absence tells you where it died.
+
+1. **A new `out/dbg-launch/logs/fable_2_0NN.log` exists.** No log = died before the emulator's
+   logging came up. Not a lane problem — check the working directory first.
+2. **`127.0.0.1:8791` answers** (`ping` → `{"ok": true}`), typically ~18–25 s after launch.
+3. **The env vars reached the title** — verify on the process, not by assumption:
+   `for p in $(pgrep -f 'fable_2'); do tr '\0' '\n' < /proc/$p/environ | grep '^REX_'; done`.
+   The game-job launcher process carries them and so does the title process.
+4. **The runtime reports the arm you asked for** — `guest output paint: … #0 <effect> -> WxH` in
+   the log. This is the only trustworthy confirmation that a launch-time effect took; a live
+   `cvar` read can agree while the chain is still the old one.
+
+### Launch-time env, confirmed correct names
+
+`REX_` + the uppercase cvar name (`src/core/cvar.cpp:106`): `present_effect` →
+**`REX_PRESENT_EFFECT`**, `perf_log_csv` → **`REX_PERF_LOG_CSV`**. Both were verified present in
+the running title's environment.
+
+Read-only pre-flight that costs nothing and answers most of the above:
+`~/.local/bin/game-job.sh --check` (display plan, `launchable`, `would_refuse`) and
+`~/.local/bin/game-job.sh --status` (lane holder, GPU verdict, marker expiry).
