@@ -1031,3 +1031,43 @@ is not, and should be quoted with that caveat or not at all.
 Frame time did not move (33,342 → 33,344 µs median): the two-pass FSR chain costs the same as
 the single bilinear pass at this resolution on this box. p99 rose ~3%, consistent with two
 passes instead of one.
+
+---
+
+## 16. Draw resolution scale — live null on the CORRECT knob (2026-11-04)
+
+`t_c06e8813` asks whether everything scales with the draw resolution. §13 records that the
+earlier attempt used `resolution_scale`, which is **not** the SDK's scaling knob. Re-measured on
+the right one.
+
+**Both correct cvars exist and accept live writes:** `draw_resolution_scale_x`,
+`draw_resolution_scale_y` (default `1`).
+
+**Method:** interleaved in one run — set 2, capture, set 1, capture, twice — so the scene-motion
+floor is measured alongside the comparison.
+
+| | sharpness | |
+|---|---|---|
+| 1x | 29.931 / 29.778 | |
+| 2x | 29.855 / 29.644 | |
+| within-setting floor | 1x 2.47, 2x 2.28 | scene motion |
+| **cross-setting 1x vs 2x** | **2.61** | **at the floor** |
+
+**Live-toggling `draw_resolution_scale_x/y` 1↔2 produces no change distinguishable from the
+scene moving.** Sharpness is identical to two decimal places.
+
+**The caveat is the same one `present_effect` carries, and it is not yet resolved here:** a live
+write that changes nothing does **not** establish the setting is inert — it may be read at
+startup or on scene reload, exactly as the presenter's effect is (§13). The presenter's paint
+chain is *not* the right place to look for a draw-scale change either: it reports the presenter's
+own output (`1280x720 -> 3440x1440`), which is downstream of the guest render targets the draw
+scale affects.
+
+**So the honest state of this card is: live = no effect (measured); at-launch = not yet tested.**
+That is the remaining experiment, and it needs a launch-time env
+(`REX_DRAW_RESOLUTION_SCALE_X` / `_Y`) plus something in the log that reports an internal render
+target size to confirm the scale took — otherwise the comparison repeats the same scene-motion
+problem.
+
+**Do not repeat the mistake this section corrects:** `resolution_scale` accepting a value is not
+evidence it is the knob that scales anything.
