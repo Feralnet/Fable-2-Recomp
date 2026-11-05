@@ -1318,3 +1318,54 @@ into a one-word answer.
 §14 (working directory), §12 (process-first-token), §20 (cache-as-recipe), §21 (stale cache): four
 failures with the same shape — **a mechanism invoked by hand, without asserting a property of the
 result.** Each one produced an error message that pointed somewhere other than the cause.
+
+---
+
+## 22. #554 before/after — both arms built, and what the comparison can and cannot say
+
+`t_6847d4fd` wanted a behaviour comparison of the patched (#554, 61,225 functions) and unpatched
+(61,008) builds. Both arms now exist, both carry the control channel, and both are drivable
+through the same walk.
+
+| arm | exe | added-addresses | `present_effect fsr` |
+|---|---|---|---|
+| **patched** | `out/dbg-launch/fable_2.exe` (109,661,696 B, `2296436f`) | **222/222** | accepted |
+| **baseline** | `out/dbg-baseline/fable_2.exe` (109,634,048 B, `e31ac67e`) | **27/222** (= chance floor) | **rejected** |
+
+Two independent identities agree on each arm: the address table in the binary, and whether the
+runtime accepts the armed effects.
+
+### A second arm needs a STAGED LAUNCH DIR, not just its exe (§23)
+
+The first baseline launch sat alive with no log and no control channel. Cause: a CMake build
+directory is **not** a deploy directory. The game needs `default.xex`, `pfx` and `saves` beside
+the exe — in `out/dbg-launch/` those are **symlinks into `out/launchcheck/`**, and the fresh build
+dir had none of them. With no content the process starts and never reaches logging or the
+listener, while `pgrep` shows it running. Fixed by staging `out/dbg-baseline/` with the exe, a
+DLL pair and the four symlinks.
+
+### What is established
+
+1. **Boot is behaviourally identical.** A normalised log diff between the arms shows only
+   environmental differences — path prefixes, a first-run `fable2_config.toml` creation, shader
+   and pipeline timings, and two lines caused by my own probing. **No structural difference.**
+   The 222 functions change nothing about startup.
+2. **Both arms reach the same game state.** Both arrive at the character-select screen with the
+   same menu and the same selection.
+3. **The UI content matches within the noise floor.** On the same screen, the static menu-button
+   strip differs by `mean|diff| = 2.29` — the scene-motion floor measured elsewhere is ≈2.4 —
+   while the whole frame differs by 11.57.
+4. **Frame time is unchanged**: baseline median 33,344 µs against the patched arm's 33,344 µs.
+
+### What is NOT established, and why
+
+**This is not a pixel-level same-scene comparison, and this title makes that hard.** The main
+menu's background artwork **rotates** (observed: autumn, then snowy twilight, then a lake at
+dusk across captures), so two captures of the *same screen* are not pixel-comparable across runs.
+A whole-frame diff between them measures which artwork was up, not behaviour. That is why the
+result is stated on the **static UI strip** and the **log**, not on the frame.
+
+For a true same-scene test this title needs one of: a save both arms load into the same world
+position; a scene with no rotating art; or per-frame capture aligned to a fixed game event. Until
+then, "the UI and boot are identical" is the honest claim, and "behaves identically in gameplay"
+is **not** — nobody has compared the same gameplay scene in both arms.
