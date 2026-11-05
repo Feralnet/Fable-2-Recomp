@@ -167,3 +167,50 @@ project, because its author needed all of it; the instruments are the *cheap* pa
 re-deriving them is the expensive one.
 
 **When you next touch a different port, do this same pass on it and write the same page.**
+
+---
+
+## 10. Driving the menus with the remote pad — MEASURED 2026-11-04
+
+Recorded because the port's own protocol doc does not cover menu gesture timing, and it cost
+a long trial-and-error loop to learn. All of this is via `tools/fable2_control.py` on a
+`RelWithDebInfo` build (the channel is `Debug`/`RelWithDebInfo` only — see the gate in §1).
+
+**The path into the game, confirmed end to end with no human and no window focus:**
+boot → *press-Ⓐ* prompt (`press A`) → **main menu** (`press A`) → **New Game** (`press A`) →
+**gender select** (two hero cards) → the game.
+
+| gesture | behaviour |
+|---|---|
+| **D-pad `Up`/`Down`** | **works for menu navigation** — use this |
+| **left stick** (`StkLy` ±32767, and `StickUp`/`StickDown`) | **did not move the selection** in these menus |
+| **`press X --hold 120`** | too short — **no movement** |
+| **`press X --hold 300`** | **two steps** (~150 ms per step) |
+| **`press X --hold 2500`** | runs to the **end** of the list and stops there |
+| a press issued **while another button is still held** | **swallowed** — `clear` first |
+
+So: to step *one* item, hold **between ~120 and ~300 ms** and make sure nothing else is held;
+to reach a known end of a list, hold long and then step off it. `get-state` confirms what is
+actually held — check it, because a long hold keeps the button down after the call returns.
+
+**Reliable recipe for "get past the menus into gameplay":** press `A` on the menu (which
+takes *New Game*), then `A` on the gender-select cards.
+
+### The state classifier is not an oracle here
+
+`fable2_control.py game-state` (documented states: `PreMainMenu` / `PressAScreen` /
+`MainMenuMovie` / `MainMenu` / `?`) returned **`{"code":0,"name":"Unknown","front_end":"DefaultScenario"}`
+for the entire session — 28 samples across a 140 s run, through the press-Ⓐ prompt, the main
+menu, and gender select. **Do not treat it as a gate or a verification.** Use a frame.
+
+### Capturing frames
+
+`fable2_control.py screenshot <path>` writes the game's own guest output (1280×720) and works
+while other windows cover it. The PNG is **uncompressed**, so **every capture is exactly
+2,765,798 bytes** — constant size is expected and is *not* a sign of a stuck capture. `avg_luma`
+in the reply is the real content signal.
+
+**And when you look at a frame, ask neutrally — "What is on this screen?"** Naming the items
+you expect, or offering a choice between hypotheses, biases the reading and produces
+contradictory answers about the same screen. A neutral ask gives trustworthy *layout* and
+unreliable *names* (it read this menu correctly while calling the game three different titles).
