@@ -124,6 +124,26 @@ if exist "%PATCH_PERF%" (
         )
     )
 )
+rem Optional fourth patch: make Presenter's layout independent of the rexui-
+rem PRIVATE REX_HAS_FIDELITYFX_SDK define, and move OnGuestVblank() out of the
+rem header into the exported table (see docs/FABLE2_UPSCALING_SPIKE.md section
+rem 12). Without this the GPU plugin writes guest_vblank_count_ at the option-OFF
+rem offset, which is ui_draw_next_iterator_ in the armed runtime. Must come after
+rem the FSR patch, which introduces the conditional members it hoists.
+set "PATCH_LAYOUT=%REPO%\thirdparty\rexglue-sdk-presenter-layout-invariant.patch"
+if exist "%PATCH_LAYOUT%" (
+    git apply --check "%PATCH_LAYOUT%" >nul 2>&1
+    if errorlevel 1 (
+        echo Note: %PATCH_LAYOUT% does not apply to this SDK pin - skipping.
+    ) else (
+        git apply "%PATCH_LAYOUT%"
+        if errorlevel 1 (
+            echo Error: applying the presenter layout-invariance SDK patch failed. 1>&2
+            popd
+            exit /b 1
+        )
+    )
+)
 popd
 
 echo OK: ReXGlue SDK source at %SRC% (commit %PIN_COMMIT% + local patch)

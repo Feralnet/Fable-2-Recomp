@@ -1,0 +1,118 @@
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 3945fce..3ac282f 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -192,13 +192,19 @@ class Presenter {
+   // GraphicsSystem::MarkVblank). Increments the guest vblank counter that the
+   // guest-vblank frame pacer (GuestVblankPaceAllows) gates on, so the host
+   // present rate tracks the *actual* guest vblank cadence. Thread-safe (atomic);
+-  // called from the GPU VSync thread. Defined inline (not in presenter.cpp) so
+-  // the GPU plugin - which holds the Presenter but does not link the rexui
+-  // object library (symbols come via the curated rexruntime export table) - can
+-  // call it without needing an exported symbol.
+-  inline void OnGuestVblank() {
+-    guest_vblank_count_.fetch_add(1, std::memory_order_relaxed);
+-  }
++  // called from the GPU VSync thread.
++  //
++  // Deliberately defined out of line (presenter.cpp) and exported through the
++  // curated rexruntime export table (src/system/rexruntime.def): the caller is
++  // the GPU plugin, which holds the Presenter but does not link the rexui object
++  // library, so it must not be handed a member offset to bake into its own
++  // translation unit. An inline body here made the plugin's copy of this
++  // function write guest_vblank_count_ at the offset *the plugin* computed for
++  // Presenter - and because REX_HAS_FIDELITYFX_SDK is a rexui-PRIVATE define,
++  // that offset disagreed with the runtime's whenever the FidelityFX-gated
++  // members were compiled in, landing the increment on the low byte of
++  // ui_draw_next_iterator_ once per emulated vblank.
++  void OnGuestVblank();
+ 
+   class GuestOutputRefreshContext {
+    public:
+@@ -240,7 +246,11 @@ class Presenter {
+ #endif
+     };
+ 
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++    // Present regardless of REX_HAS_FIDELITYFX_SDK: this enum and the constants
++    // below size and initialise members that are also present unconditionally
++    // (see the private members of this class), so that the layout of
++    // GuestOutputPaintConfig - and therefore of Presenter - does not depend on a
++    // PRIVATE compile definition of the rexui target.
+     enum class FsrQualityMode {
+       // Keep current behavior and use the guest output size as-is.
+       kAuto,
+@@ -272,7 +282,6 @@ class Presenter {
+     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
+     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
+                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
+-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+ 
+     // In the sharpness setters, min / max with a constant as the first argument
+     // also drops NaNs.
+@@ -326,12 +335,15 @@ class Presenter {
+     // original front buffer as possible.
+     bool allow_overscan_cutoff_ = false;
+     Effect effect_ = Effect::kBilinear;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++    // Present unconditionally, even when the FidelityFX SDK is not compiled in,
++    // so that this class - a member of Presenter, which the GPU plugin holds
++    // across a module boundary - has the same layout in every target regardless
++    // of the rexui-PRIVATE REX_HAS_FIDELITYFX_SDK define. When the option is
++    // off these members are simply never read.
+     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
+     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
+     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
+     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
+-#endif
+     bool dither_ = false;
+   };
+ 
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 621964d..bf08296 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -67,6 +67,12 @@ if(WIN32 AND NOT REXGLUE_USE_VULKAN)
+     list(JOIN REXRUNTIME_EXPORT_LINES "\n" REXRUNTIME_EXPORT_TEXT)
+     set(REXRUNTIME_DEF "${CMAKE_CURRENT_BINARY_DIR}/rexruntime-d3d12.def")
+     file(WRITE "${REXRUNTIME_DEF}" "${REXRUNTIME_EXPORT_TEXT}\n")
++    # The filtered table is generated at CONFIGURE time, so without this an edit
++    # to src/system/rexruntime.def would be silently ignored by a D3D12-only
++    # build (the linker keeps using the stale generated copy, and a newly
++    # exported function only shows up as an undefined symbol at link time).
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
++        "${CMAKE_CURRENT_SOURCE_DIR}/rexruntime.def")
+ endif()
+ # lld-link needs the /DEF: flag (a bare positional .def path is "unknown file
+ # type"). The flag must reach lld-link (not clang++), so it is passed via
+diff --git a/src/system/rexruntime.def b/src/system/rexruntime.def
+index 2e4fa23..0fe0fb5 100644
+--- a/src/system/rexruntime.def
++++ b/src/system/rexruntime.def
+@@ -127,6 +127,7 @@ EXPORTS
+ ?LookupHeap@Memory@memory@rex@@QEBAPEBVBaseHeap@23@I@Z
+ ?MaybeYield@thread@rex@@YAXXZ
+ ?NotifyUILoopOfPendingFunctions@SDLWindowedAppContext@ui@rex@@UEAAXXZ
++?OnGuestVblank@Presenter@ui@rex@@QEAAXXZ
+ ?Open@Window@ui@rex@@QEAA_NXZ
+ ?OpenFile@filesystem@rex@@YAPEAU_iobuf@@AEBVpath@1std@@V?$basic_string_view@DU?$char_traits@D@std@@@5@@Z
+ ?PWLGammaToLinear@xenos@graphics@rex@@YAMM@Z
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 5585f1a..a1cf6da 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -894,6 +894,14 @@ void Presenter::RequestUIPaintFromUIThread() {
+   }
+ }
+ 
++void Presenter::OnGuestVblank() {
++  // Deliberately out of line and exported (src/system/rexruntime.def): called
++  // from the GPU plugin, which does not see this target's private compile
++  // definitions and therefore must not bake a member offset. See the comment on
++  // the declaration in include/rex/ui/presenter.h.
++  guest_vblank_count_.fetch_add(1, std::memory_order_relaxed);
++}
++
+ bool Presenter::InitializeCommonSurfaceIndependent() {
+   {
+     std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);

@@ -1139,3 +1139,379 @@ Basis for the decision:
 - 24 launches, ledger `~/.hermes/logs/game-jobs.jsonl` (051-074).
 - `out/launchcheck/` restored to the option-OFF control pair (`a27a9a5b…`)
   after the batch, as §9.4 left it.
+
+## 12. The repair (kanban `t_ab11feef`) — the layout no longer depends on the PRIVATE define, and the plugin no longer bakes an offset
+
+**Bottom line: fixed, and proved by rate and by instrument.** The armed build
+survived **7 of 7** launches (6 bilinear + 1 FSR) where the pre-fix build crashed
+**2 of 2** in the same session; the option-OFF build survived 3 of 3. The
+`§11.2(c)` hexdump test is now clean in both builds: **0 byte-0 moves in 12,954
+armed walks and 12,975 option-OFF walks**, against 10 in 12,703 before the fix.
+The detector reported **0 dead-iterator events** in both. FSR still runs
+(`fsr-easu -> fsr-rcas`, 6 dump pairs, measured below) on a build that does not
+crash.
+
+Two independent changes were made, and they were made *both*, not one of them:
+
+1. **the layout of `Presenter` no longer depends on `REX_HAS_FIDELITYFX_SDK`** —
+   so the option cannot shift a member offset for anyone; and
+2. **`OnGuestVblank()` is out of line and exported** — so no caller bakes an
+   offset at all, including for members that do not exist yet.
+
+### 12.1 The choice, and what it costs
+
+The card asked for both options to be evaluated. Both were implemented and
+measured; here is why the pair, rather than either alone:
+
+| option | what it fixes | what it leaves | verdict |
+|---|---|---|---|
+| **Minimal** — propagate `REX_HAS_FIDELITYFX_SDK` to `rexgpu-xenos` | today's offsets | the class stays layout-fragile: every future member addition moves `ui_draw_next_iterator_` again, and every future inline accessor re-opens the hole | **rejected** |
+| **Layout invariance** (chosen, part 1) | the whole *class* of bug for this define, permanently | a caller still bakes an offset — correct today, fragile under a new define | kept |
+| **Out-of-line + exported accessor** (chosen, part 2) | bakes nothing in any caller, ever | does not by itself protect *other* accessors | kept |
+
+The minimal option was rejected on cost/benefit: propagating the define to the
+plugin drags `REX_HAS_FIDELITYFX_SDK` into a target that must not have it. It
+happens *today* not to include any FidelityFX header (`presenter.h`'s includes
+are standard-only — checked), so it would "work"; but it would silently make the
+plugin's behaviour depend on a build option that has nothing to do with GPU
+plugin code, and it would still leave the layout conditional. The card's own
+instruction — "if doing so drags FidelityFX code into the plugin, this is not
+minimal and probably wrong" — points at the same conclusion from the other side:
+it does not drag code today, and the fact that it *could* tomorrow is the reason
+not to do it.
+
+**Cost of what was chosen:**
+
+- `sizeof(GuestOutputPaintConfig)` is **16 bytes larger in option-OFF builds**
+  (12 → 28). No allocation changes: those members are a float, a uint32, a float
+  and an enum, never read when the option is off. No VRAM, no per-frame work.
+- **One new export** in the curated table (`rexruntime.def`), 118th entry,
+  `?OnGuestVblank@Presenter@ui@rex@@QEAAXXZ`. Export-section growth is one entry;
+  no existing import changes, so **no rebuild of `fable_2.exe` is required** — the
+  game imports the runtime, the plugin is runtime-loaded.
+- **ABI:** `Presenter` is now the *same* size in both configurations, which is a
+  simplification, not a break — anything built before against the option-OFF
+  layout is unaffected in its own layout, and the option-ON build now agrees with
+  it.
+- **Rebuild shape:** a header change, so `rexui` + the plugin's
+  `graphics_system.cpp` recompile. Incremental build: ~5 s. Full DLL pair for
+  both configurations: ~2 min each.
+- **A trap found on the way** and closed in the same patch: for a D3D12-only
+  build the export table is *filtered into*
+  `${CMAKE_CURRENT_BINARY_DIR}/rexruntime-d3d12.def` at **configure** time, so a
+  `.def` edit is silently ignored by a plain incremental build — the symptom is
+  `undefined symbol: public: void __cdecl rex::ui::Presenter::OnGuestVblank(void)`
+  at link. `src/system/CMakeLists.txt` now lists `rexruntime.def` in
+  `CMAKE_CONFIGURE_DEPENDS`, so editing it re-runs CMake.
+
+**Residual fragility, stated plainly:** the *class* is fixed for this define, but
+the general trap remains for any future `PRIVATE` define that adds or removes a
+public class member. Nothing in the build system stops that. The out-of-line
+accessor removes the trap for *this* call path; a future inline accessor in a
+public header would re-open it, which is why §12.7's sweep rule belongs in the
+SDK's contribution guidance (see the held upstream report).
+
+### 12.2 The layout is now invariant — three ways to see it
+
+**(a) Compile-time, with and without the define.** A probe TU that includes
+`include/rex/ui/presenter.h` with `#define private public` and prints the real
+offsets (probe kept out of the tree, `cache/scratch/offsetprobe.cpp`):
+
+| | before the fix, OFF | before, ON | **after, OFF** | **after, ON** |
+|---|---|---|---|---|
+| `sizeof(Presenter)` | 432 | 448 | **448** | **448** |
+| `offsetof(ui_draw_next_iterator_)` | `0x160` | `0x170` | **`0x170`** | **`0x170`** |
+| `offsetof(guest_vblank_count_)` | `0x170` | `0x180` | **`0x180`** | **`0x180`** |
+| `sizeof(GuestOutputPaintConfig)` | 12 | 28 | **28** | **28** |
+
+(Host/Linux `clang`, so the absolute numbers differ from the Windows ones below;
+the *equality* is the property, and the pre-fix column proves the probe is
+sensitive.) A `-Xclang -fdump-record-layouts` diff of the whole header is
+identical between the two modes after the fix; before it, only
+`GuestOutputPaintFlow` (the internal struct sized by
+`kMaxGuestOutputPaintEffects`) differed.
+
+**(b) In the shipped binaries.** Both configurations' `rexruntime.dll` now open
+`OnGuestVblank` with the same instruction and the same offset:
+
+```
+armed     : 1800eaf60 <?OnGuestVblank…>: f0  lock | 48 ff 81 f8 01 00 00  incq 0x1f8(%rcx)
+option-OFF: 1800ead40 <?OnGuestVblank…>: f0  lock | 48 ff 81 f8 01 00 00  incq 0x1f8(%rcx)
+```
+
+`0x1F8` is `guest_vblank_count_` in *both* — which is the invariant asserted as
+a binary fact rather than a source reading. Neither `rexgpu-xenos.dll` contains
+any `incq 0x1e8`.
+
+**(c) At runtime.** The instrumented option-OFF build now reports the drawer
+iterator at `+488` (`0x1E8`), the same offset the armed build reports; before
+the fix the option-OFF layout put it at `0x1D8`. The detector computes its
+offset as `&ui_draw_next_iterator_ - this` (`REX_UI_DRAWERS_DETECT`, §11.2(c)),
+so that agreement is measured, not assumed.
+
+### 12.3 The plugin no longer bakes an offset
+
+`src/graphics/graphics_system.cpp` (`MarkVblank`) now *calls* the export:
+
+```
+1547: e8 00 00 00 00   callq  …
+      IMAGE_REL_AMD64_REL32  ?OnGuestVblank@Presenter@ui@rex@@QEAAXXZ
+```
+
+Both call sites (the vblank path and the `SetupGuestGpu` lambda) are relocations
+against the import table; there is no `+offset` instruction left in the plugin
+for this accessor. The `incq 0x1e8(%rax)` that §11.2(b) recorded in
+`graphics_system.cpp.obj` is gone from both configurations' objects.
+
+### 12.4 Rates — 12 launches, this session, one batch, same lane
+
+Arms: **B** = pre-fix armed build (`out/fsr-clean`, `13a5d065…`, the same binaries
+§11 measured); **F** = armed + fix (`5185f715…` runtime / `9f254a46…` plugin);
+**C** = option-OFF + fix (`0698cb62…` / `feacaefa…`); **V** = armed + fix, FSR.
+Lane `game-job.sh` (DP-1 default, window placed never activated, audio muted),
+`--timeout 130 --gpu-wait 0`, inner bar `/usr/bin/timeout -k 15 75`, interleaved
+so drift cannot track the arm.
+
+| # | log | arm | rc | alive after 1st paint | note |
+|---|---|---|---|---|---|
+| 01 | 075 | **B** | **5** | 22.5 s | pre-fix crash |
+| 02 | 076 | F | 124 | 73.7 s | survived the bar |
+| 03 | 077 | C | 124 | 74.2 s | control |
+| 04 | 078 | F | 124 | 73.7 s | |
+| 05 | 079 | **B** | **5** | 22.0 s | pre-fix crash |
+| 06 | 080 | C | 124 | 74.8 s | control |
+| 07 | 081 | F | 124 | 74.2 s | `REX_UI_DRAWERS_DETECT` |
+| 08 | 082 | F | 124 | 73.2 s | present dumps (bilinear) |
+| 09 | 083 | C | 124 | 74.2 s | control + detector |
+| 10 | 084 | F | 124 | 74.2 s | |
+| 11 | 085 | **V** | 124 | 73.8 s | FSR + present dumps |
+| 12 | 086 | F | 124 | 74.8 s | |
+
+**Pre-fix armed: 2 of 2 crashed. Armed + fix: 7 of 7 survived (6 bilinear, 1 FSR).
+Option-OFF + fix: 3 of 3 survived.** Against §11's 6-of-6 / 18-of-18, the
+pre-fix armed build is now **8 of 8 crashes across two sessions** and the fixed
+armed build **7 of 7 survivals**, with controls bracketing at positions 3, 6 and
+9. `rc 5` is the crash; `rc 124` is the lane's own 75 s timer, i.e. alive at the
+bar.
+
+Every chain line is the same shape as before the fix — `1280x720 -> 3440x1440,
+1 pass(es): #0 bilinear -> 2560x1440` (or `2 pass(es): #0 fsr-easu … #1
+fsr-rcas` on 085) — so the fix changed nothing about the present path itself.
+
+**GPU pressure was equal across every arm:** free VRAM was 8.5–8.7 GB for all 12
+launches (ledger `pre_free_vram_mb`: 8865, 8503, 8482, 8483, 8509, 8530, 8509,
+8510, 8511, 8510, 8688, 8599). The resident `qwen3-tts` server held ~5 GB at the
+start of this pass but had released its model (274 MiB resident) before the
+batch, so it was **not** a confounder — and, unlike §11, the crash arm and the
+surviving arms ran at the *same* pressure.
+
+Noted for honesty: the lane marks 9 of the 12 rows `verdict: FAIL — free vram
+… below baseline`, because a **surviving** run leaves ~800 MB of presenter and
+allocator memory briefly unreleased; the two crashing runs `PASS` because the
+process died. That is the lane's post-run accounting, not a launch outcome — the
+outcome measure here is `rc` and time alive.
+
+### 12.5 The direct test — the byte stops moving
+
+`REX_UI_DRAWERS_DETECT` hexdumps 32 bytes at the *real* offset of
+`ui_draw_next_iterator_` before and after every `Draw()` (§11.2(c)). Counting
+across whole logs:
+
+| log | build | walks (pre/post pairs) | byte 0 (`0x1E8`) moves | byte 11 (`0x1F3`) | dead iterator |
+|---|---|---|---|---|---|
+| `detect-19` (§11, **before**) | armed | 12,703 | **10** (`40 -> 41`) | 12,703 × `0 -> 1` | 58 |
+| `fix-batch/detect-f7.txt` (**after**) | armed + fix | 12,954 | **0** | 12,954 × `0 -> 1` | **0** |
+| `fix-batch/detect-c9.txt` (**after**) | option-OFF + fix | 12,975 | **0** | 12,975 × `0 -> 1` | **0** |
+
+Byte 11 flipping on *every* walk in the fixed logs is the control that matters:
+the hexdump is live and the harness still sees presenter writes — the zero in the
+byte-0 column is a real silence, not a dead instrument. Sample from `f7`:
+
+```
+walk 0 pre-draw  +488: 50 83 2d 00 00 00 00 00 01 01 00 |00| …
+walk 0 post-draw +488: 50 83 2d 00 00 00 00 00 01 01 00 |01| …
+```
+
+Byte 0 unchanged; only `request_ui_paint_after_current_ui_thread_paint_` flips,
+which is `presenter.cpp`'s own write at the correct offset.
+
+### 12.6 FSR re-verified after the fix — and the first honest look at it
+
+Launch 11, `present_effect=fsr`, armed + fix, survived the bar:
+
+- chain logged: `1280x720 -> 3440x1440, 2 pass(es): #0 fsr-easu -> 2560x1440 #1
+  fsr-rcas -> 2560x1440`;
+- **6 dump pairs**, identical paint indices 300/500/700/900/1100/1300 at
+  3440x1440, in `out/fix-batch/dumps-fsr/` (bilinear companion run: launch 08,
+  `dumps-bilinear/`).
+
+Measured (`cache/scratch` script, Laplacian std, numpy; whole frame and a
+900x240 crop grid — the "best-gain" column is the crop where FSR gains most
+among crops with real edge content, so it is chosen by the data not by hand):
+
+| paint | whole-frame std bilinear -> fsr | busiest crop | best-gain crop |
+|---|---|---|---|
+| 300 | 3.402 -> 3.662 (**+7.7 %**) | +1.4 % | +9.9 % |
+| 500 | 3.396 -> 3.689 (**+8.6 %**) | +1.2 % | +7.4 % |
+| 700 | 4.051 -> 4.322 (**+6.7 %**) | +1.2 % | +7.5 % |
+| 900 | 4.550 -> 4.678 (**+2.8 %**) | +0.7 % | +6.2 % |
+| 1100 | 5.260 -> 5.550 (**+5.5 %**) | +2.0 % | +5.6 % |
+| 1300 | 6.706 -> 6.904 (**+2.9 %**) | -0.1 % | +2.5 % |
+
+**What the upscaling actually looks like, on a build that does not crash:** the
+EASU+RCAS chain is operating and measurably sharpening (whole-frame +2.8 to
++8.6 %, best local crop +2.5 to +9.9 %), and the rendered image is *stable* —
+frame-to-frame whole-frame RMSE between the bilinear and FSR runs is 0.56–0.72
+out of 255 for paints 300–1100, i.e. the two runs are the same scene rendered
+with the same inputs. These are the **boot-video frames**, which are smooth: this
+is a small effect on smooth content and would be larger on UI/text, exactly as
+§4 found with a hand-picked wordmark crop (+132 %). Paint 1300 (RMSE 2.4) is a
+scene transition and is not comparable.
+
+No artefacts were seen in the dumps at these indices; that statement is bounded
+by six frames of a boot video and is not a claim about gameplay.
+
+### 12.7 The sweep — same class of bug elsewhere
+
+**Method** (repeatable; scripts kept in `~/.hermes/kanban/workspaces/t_ab11feef/`):
+1. enumerate every compile definition applied **PRIVATE** to an in-tree target
+   (`grep -rn target_compile_definitions --include=CMakeLists.txt`);
+2. for each, grep `include/rex/**/*.h` for conditional regions and classify them
+   as **layout** (declares members / sizes a struct / initialises a member) or
+   **behaviour** (enumerators beyond the first, switch arms, functions, static
+   asserts);
+3. enumerate every inline member function defined inside a class body in
+   `include/rex/**/*.h` whose body touches a member (1,119 found; the SDK's
+   `member_` convention makes this mechanical — `sweep-layout-collisions.py`);
+4. cross-reference those that live in a layout-conditional header against call
+   sites outside their own library (`rexgpu-xenos` = `src/graphics/**`,
+   `rexruntime` = `src/system|core/**`, and the game tree) —
+   `xref-inline.py`;
+5. for each cross-module hit, check whether the *class* that owns the accessor
+   has a define-dependent layout. That, and only that, is the defect.
+
+**Result: one live hit — the one this pass fixed — and it is now safe.**
+Everything else is either behaviour-only, PUBLIC (so every target agrees), or
+internal to `rexui`. Full inventory:
+
+| # | site | define scope | kind | class |
+|---|---|---|---|---|
+| 1 | `include/rex/ui/presenter.h:196,243,329` — `OnGuestVblank` inline + `GuestOutputPaintConfig` members | `PRIVATE rexui` | **layout + cross-module inline** | **LIVE — the defect; fixed here** |
+| 2 | `presenter.h:233` `Effect` enumerators | `PRIVATE rexui` | behaviour (enum width unchanged) | safe |
+| 3 | `presenter.h:297` config get/set accessors | `PRIVATE rexui` | behaviour (no layout) | safe |
+| 4 | `presenter.h:454` `GuestOutputPaintEffect` enumerators | `PRIVATE rexui` | behaviour (enum width unchanged) | safe |
+| 5 | `presenter.h:488` `kMaxGuestOutputPaintEffects` → sizes `GuestOutputPaintFlow` | `PRIVATE rexui` | layout of an **internal** struct, returned by value from a private method; no cross-module caller (checked) | latent (safe today) |
+| 6 | `presenter.h:575-642` `CasSharpenConstants` etc. | `PRIVATE rexui` | internal helper structs, `rexui`-only | latent (safe today) |
+| 7 | `d3d12_presenter.h:140` root-signature index enum | `PRIVATE rexui` | behaviour (enum values) | safe |
+| 8 | `d3d12_presenter.h:156` switch over effects | `PRIVATE rexui` | behaviour | safe |
+| 9 | `d3d12_presenter.h:250` `PaintContext::guest_output_intermediate_textures[kMaxGuestOutputPaintEffects-1]` | `PRIVATE rexui` | layout of `D3D12Presenter` (a **derived** class the plugin includes but never instantiates; it only casts to `D3D12GuestOutputRefreshContext`, whose layout is invariant — verified at the two call sites) | latent (safe today) |
+| 10 | `vulkan/presenter.h:233,249` + `:393-396` arrays | `PRIVATE rexui` | same shape as 7-9 | latent (and Vulkan is off in this build) |
+| 11 | `d3d12_presenter.h:270,320` / `vulkan/presenter.h:438,484` — `REX_HAS_FIDELITYFX_RUNTIME` adds `temporal_upscaler_*` members | `PRIVATE rexui` | layout of the derived presenters, after `paint_context_`; no inline accessor for them; **option OFF in this build** | latent |
+| 12 | `include/rex/graphics/flags.h:82,98`, `include/rex/ui/flags.h:42,51` — `REX_HAS_D3D12` / `REX_HAS_VULKAN` | **PUBLIC** on `rexcore` + `rexruntime` (`src/core/CMakeLists.txt:120,123`, `src/system/CMakeLists.txt:141,149`) | enum values only | safe — every consumer sees it |
+| 13 | `REX_PLATFORM_*`, `REX_ARCH_*`, `REX_COMPILER_*` (16+17+4 uses) | derived inside `rex/platform.h` from compiler built-ins | platform/arch | safe by construction — identical in every TU |
+| 14 | `REXGLUE_BUILD_CONFIG` (string) | `PRIVATE` per title target (`cmake/rexglue_helpers.cmake:84`) | string literal, not used by any header | safe |
+| 15 | `Window::presenter()` `window.h:571` — inline accessor **called from the game exe** (`src/diagnostics/fable2_screenshot.h:73`) | n/a | `window.h` contains **zero** `#if` | safe |
+| 16 | `IGraphicsSystem::provider/presenter` (`system/interfaces/graphics.h:57-58`) | n/a | **virtual** → vtable dispatch, no offset baked | safe by construction |
+| 17 | `Presenter::GuestOutputRefreshContext::SetIs8bpc` (plugin call sites `src/graphics/{d3d12,vulkan}/command_processor.cpp`) | n/a | caller class has no conditional members (`bool&`) | safe |
+| 18 | `D3D12GuestOutputRefreshContext::resource_uav_capable`, `VulkanGuestOutputRefreshContext::{image,image_view,image_version,image_ever_written_previously}` | n/a | small context classes, invariant layout | safe |
+| 19 | `GuestOutputPaintConfig` get/set accessors (`presenter.h:298-320`) | `PRIVATE rexui` | **no** cross-module caller — none in `src/graphics/**`, none in the game tree | safe |
+
+Counts: **1,119** inline member functions in public headers touch a member; **46**
+of them live in headers carrying a layout-conditional region; the cross-
+referencer finds **10** of those with a call site outside `rexui`, and each was
+checked by hand — **6 are genuine** cross-module calls (items 17-18, all on the
+two small refresh-context classes) and **4 are name collisions** on unrelated
+types (`->provider()` on `IGraphicsSystem`, `->memory()`, `->view()`,
+`->vulkan_device()` on providers). Of the six genuine ones, **exactly one** — item
+1, `OnGuestVblank` — belonged to a class whose layout depended on a `PRIVATE`
+define. **One live defect, now fixed. Ten latent items, all listed above with the
+reason they are safe today.**
+
+(Note on the tooling: the cross-referencer attributes a nested class's method to
+its enclosing class, which is why check-by-hand was part of the method rather
+than an optional extra.)
+
+The rule the sweep implies, and the one worth upstreaming: *a `PRIVATE` compile
+definition must not change the layout of a type that appears in a public header.
+If it does, the affected members go behind a pointer, become unconditional, or
+the accessor that exposes them moves out of line and into the export table.*
+
+### 12.8 Instrumentation disposition
+
+- **Kept in the tree, as its own tracked patch**
+  (`thirdparty/rexglue-sdk-ui-drawer-instrumentation.patch`): the
+  `REX_UI_DRAWERS_DETECT` walk/hexdump diagnostics and the `REX_UI_DRAWERS_FIX`
+  workaround arm. Both are env-gated and inert unless asked for; the detector is
+  what makes §12.5 repeatable, and this pass used it unchanged.
+- **Kept, permanent, and part of the new fix patch**: the layout change, the
+  out-of-line exported accessor, and the `CMAKE_CONFIGURE_DEPENDS` guard.
+- **Not shipped in any patch**: the two throwaway probes used for §12.2 —
+  `offsetprobe.cpp` (`#define private public`, prints real offsets) and
+  `layoutprobe.cpp` (`-fdump-record-layouts` driver). Both live only in
+  `~/.hermes/profiles/rigsy/cache/scratch/`.
+- **Removed this pass**: nothing was left behind in the SDK tree that is not
+  either in the fix patch or in the instrumentation patch — verified by
+  reproducing the tree byte-for-byte from the patch stack (§12.9).
+
+### 12.9 Reproducibility
+
+`thirdparty/rexglue-sdk-presenter-layout-invariant.patch` (4 files: the header,
+`presenter.cpp`, `rexruntime.def`, `src/system/CMakeLists.txt`) applies **after**
+the FSR, perf-CSV and instrumentation patches on the pinned `cc5f03d`.
+verified: on a clean worktree of `cc5f03d`, applying
+`rexglue-sdk-fsr1-raster` → `rexglue-sdk-perf-csv-and-vc-dump` →
+`rexglue-sdk-guest-exit-status-probe` → `rexglue-sdk-ui-drawer-instrumentation` →
+`rexglue-sdk-presenter-layout-invariant` reproduces the live SDK tree's
+`git diff` **byte-for-byte** (`diff -q` identical; the tree's total diff is 950
+lines before this pass's fix and 1,064 after). `tools/setup_sdk_src.cmd` now
+applies the new patch as its fourth optional step, with the same "only if it
+applies cleanly" guard. Nothing was committed to the SDK tree.
+
+### 12.10 Recommendation
+
+**The armed build is now fit to go on the operator's install, with one caveat
+that is about policy rather than code:** the crash that kept it off is fixed at
+its cause rather than worked around — the corrupting write no longer happens, the
+offset it was writing to is now `guest_vblank_count_` in both builds, and the
+vblank counter the pacer gates on is incremented for the first time in the armed
+build. 7/7 survivals, an instrumented build that shows the byte no longer moving,
+and an FSR chain that still runs.
+
+The caveat: the fix lives in an SDK **patch**, not upstream, and the SDK tree
+stays at `cc5f03d` + patch stack — so any rebuild that forgets the patch
+reintroduces the crash. `tools/setup_sdk_src.cmd` now applies it automatically,
+which is the mitigation.
+
+- **keep on `feral/dlss`** — yes; it is the only build that exercises FSR and it
+  is now instrumented, understood and stable;
+- **install** — the blocker is cleared; the remaining work is the ordinary
+  packaging question (which DLL pair ships), not a defect;
+- **do not revert the armed build to escape the crash** — no longer necessary.
+
+### 12.11 Artefacts from this pass
+
+- `thirdparty/rexglue-sdk-presenter-layout-invariant.patch` — the fix, 4 files,
+  applies on the pinned `cc5f03d` after the four existing patches (verified,
+  §12.9). The SDK tree itself is not committed.
+- `out/fix-armed/` — armed + fix DLL pair, `rexruntime 5185f715…`,
+  `rexgpu-xenos 9f254a46…` (arms F and V in §12.4).
+- `out/fix-off/` — option-OFF + fix pair, `rexruntime 0698cb62…`,
+  `rexgpu-xenos feacaefa…` (arms C).
+- `out/fix-batch/batch-results.csv` — one row per launch (arm, rc, wall, md5,
+  full env), 12 rows.
+- `out/fix-batch/detect/detect-f7.txt` (6.8 MB), `detect-c9.txt` (6.8 MB) — the
+  §12.5 hexdump logs; both zero-move.
+- `out/fix-batch/dumps-bilinear/` and `dumps-fsr/` — 6 PPM pairs each,
+  3440x1440, paint indices 300-1300.
+- `out/fix-batch/sharpness.txt` — the §12.6 measurements.
+- `out/fix-batch/disasm-evidence.txt` — the §12.3 disassembly.
+- `out/fix-batch/stdout-NN.txt` — raw lane output per launch.
+- `docs/UPSTREAM-REPORT-presenter-layout-collision.md` — **held, unposted**
+  (§12.10 / the card's PUBLIC POST AUDIT requirement).
+- Sweep tooling, kept for repetition:
+  `~/.hermes/kanban/workspaces/t_ab11feef/{sweep-layout-collisions.py,
+  xref-inline.py, hexdump-test.py, measure-sharpness.py, analyze-batch.py,
+  run-batch.sh}`.
+- 12 launches, logs `out/launchcheck/logs/fable_2_075..086.log`, ledger
+  `~/.hermes/logs/game-jobs.jsonl` (the 12 most recent Fable II rows).
+- `out/launchcheck/` restored to the option-OFF control pair after the batch.
