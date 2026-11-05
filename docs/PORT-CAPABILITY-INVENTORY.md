@@ -309,6 +309,21 @@ works". Before concluding an input was ignored, confirm nothing else is driving 
 screen that needed a directional input first. The remote pad's focus-independence is real; a
 genuine focus test is `xdotool`, not a supposition.
 
+**Killing and finding the title — the pattern self-matches.** `pkill -f 'fable_2.exe'` matches
+the launcher shell itself, because the pattern appears literally in the command line that
+invokes it: the script kills its own parent, and a "still running" check then reports the
+launcher as if it were the game. Anchoring the pattern does NOT fix it — the launcher's command
+line also contains the exe path *with* a slash, so `[/]fable_2\.exe` still matches it. The
+reliable discriminator is a command line that **starts with** the exe path (the wine process),
+not one that merely contains it:
+
+```bash
+pgrep -af 'fable_2\.exe' | grep -vE 'bash|game-job|gpu-job|proton|timeout'   # the game only
+```
+
+Two frames captured a few seconds apart with **different hashes** is the cheap proof that a run
+is live and rendering; a single frame, or two identical hashes, proves nothing.
+
 ### The state classifier is not an oracle here
 
 `fable2_control.py game-state` (documented states: `PreMainMenu` / `PressAScreen` /
