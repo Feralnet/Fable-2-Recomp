@@ -221,6 +221,63 @@ reaches the guest.** Those are the HOST layer (real pads, e.g. an Xbox pad and a
 (`remote_gamepad_driver.h`), registered via `fable_2_app.h:133`, `info.synthetic = true`, and
 it never appears in SDL's list — by design. Its absence there is not evidence of failure.
 
+---
+
+## 11. The state-detection probes do NOT work for this title — MEASURED 2026-11-04
+
+This matters more than it looks: two purpose-built tools exist for reading the game's state,
+both arm correctly, and **neither produces a usable answer on Fable II**. Anyone gating on
+them is gating on a constant.
+
+**How they arm.** They are **launch-time environment variables**, not cvars — setting one
+through the control channel answers `{"ok":false,"error":"unknown cvar '<NAME>'"}`. They must
+be present in the environment of the launched title, NOT the environment of a later command.
+
+Prove they arrived by reading the game's own environment rather than assuming — find the wine
+process holding the title and read its `/proc/<pid>/environ`. Both the `steam.exe` shim
+process and the `Z:\...` title process carry them; the launcher script process does not.
+
+**They write to the process CWD, which is NOT the exe dir.** Launching from a different working
+directory puts the log in that directory (e.g. `~/fable2_state_probe.log`). Look there before
+concluding a probe failed — the file existing elsewhere reads exactly like "no output".
+
+**`FABLE2_STATE_PROBE` — inert.** Ran the whole session, one sample per second (197 samples),
+and **every classifier field was constant at its default for the entire run**:
+
+```
+boot=196834ms  ?  (raw=?  pe=16 ui=993 ra=1 pa=0 menu=0 a_age=-1 a_btn=0 fe=v=DefaultScenario)
+distinct values across 197 samples:  pa: pa=0   menu: menu=0   a_age: a_age=-1
+                                     a_btn: a_btn=0   fe: fe=v=DefaultScenario
+```
+
+Only the counters `pe`/`ui`/`ra` move. The probe's own hunt line — `[fe-hunt] 0x40071545 holds
+ptr to CAN_PRESS_A` — is still hunting: it has not located the flag it keys on. So the state
+query returns `Unknown` **permanently, for this title**, while the game is demonstrably running
+and rendering. Do not use it as a gate, a verification, or a synchronisation primitive.
+
+**`FABLE2_UI_TEXT_DUMP` — never fires.** Armed and proven present in the title's environment,
+and **no dump log was created anywhere** (checked the home dir, the exe dir, the launch dir,
+and a filesystem search). Its hook does not trigger on this title. Do not count on it to read
+the menus.
+
+**What DOES work as an oracle.** The port log names real subsystems and real events — that is
+how the state was actually established:
+
+```
+[texture-morph] building hero/dog textures in realtime (GPU) mode
+[motion-blur]   game requested full-screen motion blur 0.300 (left on)
+[ui-stretch]    2D display aspect (display path) = 1.777778, hook off
+[ui-canvas]     guest display-area width = 1120 (call #1)
+```
+
+Together with `screenshot` + `avg_luma` (and a frame you actually look at), that is the working
+way to know where the game is. `avg_luma` swinging hard between samples (32 → 132 → 2) is the
+signature of an FMV cutting between shots.
+
+**Tooling gotcha.** The lane guard string-matches terminal commands, so a command that merely
+*mentions* a title launch (including one embedded in a heredoc while writing documentation) is
+refused as an out-of-lane exec. Write docs with a file tool, not a shell heredoc.
+
 ### The state classifier is not an oracle here
 
 `fable2_control.py game-state` (documented states: `PreMainMenu` / `PressAScreen` /
