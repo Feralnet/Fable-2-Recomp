@@ -951,11 +951,22 @@ control.
 
 ## 14. The working launch shape — and the CWD trap that produces a silent no-log death
 
-**`cd`ing into the exe's directory before launching kills the run silently.** Measured 2026-11-04:
-launching with `cd out/dbg-launch` as the working directory produced **no `fable_2_0NN.log` at
-all**, no control channel, and no perf CSV — the process vanished without the emulator writing a
-single line, which reads exactly like a lane, gate or VRAM fault. It was none of those: the lane
-reported `launchable: true`, `lane_held: false`, `gpu: safe 8762 MB free`, marker valid.
+**`cd`ing into the exe's directory before launching kills the run silently — REPRODUCED 2/2.**
+Measured 2026-11-04: launching with `cd out/dbg-launch` as the working directory produced
+**no `fable_2_0NN.log` at all**, no control channel, and no perf CSV — the process vanished
+without the emulator writing a single line, which reads exactly like a lane, gate or VRAM fault.
+
+**Rate and control, because one observation proves nothing:**
+- **2/2 arms** launched that way (bilinear and fsr) both reported **`launch exited 1 after 22s`**
+  — a clean non-zero exit at a consistent point, not a hang and not a crash signature.
+- **Same command, same env, launched from the repository root**: 2/2 came up (channel answering
+  in ~18 s), wrote a log, opened the CSV, and reported its paint chain.
+
+The lane was innocent in every case: `--check` reported `launchable: true`, `lane_held: false`,
+`gpu: safe` with 8,762 MB free, and a valid allow marker. **A silent no-log death is the working
+directory first, not the lane.** Note the failure shape: `exit 1` with no log is *pre-main
+logging* — the emulator never reached the point where it opens its own log file, so there is
+nothing to read and the absence of evidence is itself the signal.
 
 Relaunched with the **identical env and identical command** from the repository root, it came up
 in ~18 s, wrote `fable_2_009.log`, opened the perf CSV, and answered the control channel. The
