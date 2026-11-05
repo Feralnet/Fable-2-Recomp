@@ -1,5 +1,26 @@
 # Fable II recomp — upscaling spike: the FSR 1 present pass
 
+> ## ⚠️ SCOPE OF EVERY VERIFICATION IN THIS DOCUMENT
+>
+> **Every run recorded here is FRONT-END ONLY — boot video and menus. No test in this workstream has ever reached gameplay.**
+>
+> The lane is **structurally** incapable of it: `game-display-place.sh` states *"It never activates, raises or focuses the window — placement only, so the run does not steal his keyboard focus"*, and `game-job.sh` exposes **no input or auto-load hook**. The phrase *"window placed never activated, audio muted"* appears throughout this doc for that reason. Runs are 70–75 s from launch and sit at the boot video / front end the whole time.
+>
+> **Read every "verified" below with that scope.** Specifically:
+>
+> | claim | scope |
+> |---|---|
+> | the cross-module layout collision (§10–§12) — a byte written at `+0x1E8` per vblank | **scene-independent** — a memory offset does not depend on what is drawn |
+> | FSR runs (the `fsr-easu → fsr-rcas` chain) | **scene-independent** — the pass is attached to the present path |
+> | the codegen change from #554 (§13.5, +222 functions) | **static** — a property of the recompiler's output |
+> | the crash fix (survival rates, §12) | **front-end only.** The drawer walk is exercised at the front end, so the *mechanism* is covered; a gameplay-scene crash is **not** excluded |
+> | the FSR quality numbers (§4, §12.6) | **boot video only** — six frames of a Lionhead logo, as §4 already says of itself |
+> | #554's 222 functions behaving identically (§13.5) | ⚠️ **proves nothing unless those functions are reached at the front end** — a behaviour comparison on code that never executes is not a verification |
+>
+> **To lift this limit** one of: an auto-load-save hook in the port/SDK, input injection that does not steal the operator's focus (his decision — the no-activation rule protects it), or a human-sitting session where he loads a save and the run captures from there.
+>
+> Raised by Marcus, 2026-11-04: *"you don't have to go into the actual game, you're okay just looking at the FMV on the main menu screen? Because if not, all these tests are invalid."*
+
 Status: **spike complete, pass proven running; the early guest self-exit is real
 but INTERMITTENT (~90 % of launches, not every one) and the bisection in §7
 cleared every named suspect — read §7 before §5's attribution.** §9 identified
