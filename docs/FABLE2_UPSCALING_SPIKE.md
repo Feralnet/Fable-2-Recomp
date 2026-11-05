@@ -1579,7 +1579,7 @@ instruments were added for this pass only:
 1. `WAIT_REG_MEM … [actual N ms/s, early-woken M]` — wall time around the
    wait (`steady_clock` either side) and the count of waits that returned
    before their requested interval. On the **control this must read
-   `early-woken 0`** — it does, in all 18 instrumented control runs, which is
+   `early-woken 0`** — it does, in all 14 instrumented control runs, which is
    the check that the probe is alive rather than dead.
 2. `vblank cadence: N in 1000 ms (mean X us, min Y us, max Z us)` — interval
    statistics of the actual `MarkVblank()` dispatch, i.e. the thing #558's
@@ -1846,5 +1846,20 @@ effect of this card.
   and the two exe builds.
 - Analysis: `~/.hermes/kanban/workspaces/t_3f8bd8f5/{analyze.py, cadence.py,
   codegen-compare.py, run-one.sh, batch.sh, pr/*.diff, arms/*/}`.
-- 34 launches total through the lane; ledger `~/.hermes/logs/game-jobs.jsonl`
-  (the most recent Fable II rows).
+- 39 launches through the lane (24 in the measured batch, 6 + 6 in the two
+  cadence passes, one smoke, one #554 exe run, plus 3 cadence runs that
+  crashed on a bad half-patched DLL build — §13.12); ledger
+  `~/.hermes/logs/game-jobs.jsonl` (the most recent Fable II rows).
+
+### 13.12 One thing that went wrong, because it is a trap worth recording
+
+The first cadence control pair was built while `graphics_system.cpp` still
+carried four of PR #558's hunks from a previous apply attempt but not the
+fifth, and `command_processor.h` had already been reverted — a **half-patched
+build**. It linked, started, and crashed (rc 5, ~11 s, before the first
+`MarkVblank`), 3/3. The same source rebuilt from a clean revert survived
+(rc 124, 2,149 frames). Nothing was learned from those 3 runs except this:
+`git apply --reject` leaves a tree that still *compiles*, so a rejected hunk
+must be resolved or the patch fully reverted before any build is trusted —
+and the arm's DLL hash is the only thing that tells you which tree you
+actually measured.
