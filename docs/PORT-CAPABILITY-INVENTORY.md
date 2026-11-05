@@ -1080,3 +1080,42 @@ problem.
 
 **Do not repeat the mistake this section corrects:** `resolution_scale` accepting a value is not
 evidence it is the knob that scales anything.
+
+---
+
+## 17. Draw resolution scale — ANSWERED: it takes, and this title does not use it
+
+§16 recorded a live null and left the at-launch test open. It is now done, and the port answers
+the question itself.
+
+**Test:** launch with `REX_DRAW_RESOLUTION_SCALE_X=2` / `REX_DRAW_RESOLUTION_SCALE_Y=2`, then
+diff the boot log against a 1x arm's, normalised for timestamps, thread ids and addresses.
+
+**The line that matters — present in the 2x log and absent from the 1x log:**
+
+```
+[warning] [gpu] D3D12 draw resolution scaling is enabled, but the swap source is unscaled (NxX).
+                This title may be presenting from an unscaled resolve path.
+```
+
+**Reading:**
+
+1. **The scale took.** The port says draw resolution scaling *is enabled* — so the launch-time
+   env landed and the setting is active. The live-write null in §16 was therefore not a
+   "setting didn't apply" story.
+2. **The title does not use it.** It presents from an **unscaled resolve path**, so a scaled draw
+   target is never what reaches the swap chain. That is why the image does not change, live or at
+   launch.
+3. **This reconciles both nulls** — the earlier mis-knobbed `resolution_scale` result and the
+   correct-knob `draw_resolution_scale_x/y` result — under one mechanism, and it is a statement
+   about *this title's* resolve path, not about the knobs.
+
+**Answer to the card's question** ("does everything scale with resolution_scale — post-FX,
+shadows, particles, HUD"): **not for this title via this knob.** The scale is applied and the
+presentation path bypasses it. A per-effect breakdown is therefore moot until the title is made
+to resolve through the scaled path, which is a port/code change rather than a setting.
+
+**Method note worth keeping:** a *log diff between two arms* found this in one launch, where two
+rounds of frame comparison could not. When a visual setting appears inert, look for a line that
+reports the setting's own state before concluding from pixels — the port said "enabled" while the
+image said "nothing", and both were true.
