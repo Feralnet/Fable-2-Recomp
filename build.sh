@@ -81,10 +81,19 @@ fi
 # The Linux/Vulkan SDK fixes this script used to apply as
 # thirdparty/rexglue-sdk-linux.patch are upstream now (himdo/rexglue-sdk#12 and
 # the POSIX/Vulkan PRs merged on top of it), so the submodule pin carries them
-# and no patch step is needed. prepare_runtime_sdk.py is still run: it verifies
-# the pin really does carry the runtime fixes and initialises the SDK's own
-# dependency submodules.
-python3 "$ROOT/tools/prepare_runtime_sdk.py" "$SDKSRC"
+# and no patch step is needed.
+#
+# tools/prepare_runtime_sdk.py is not run: it accepts only an SDK revision
+# where our runtime-fixes patch applies (or reverse-applies) wholesale, and at
+# this pin most of that patch is upstream, so the gate no longer describes the
+# tree. Dependencies are initialised directly instead.
+git -C "$SDKSRC" submodule update --init --recursive
+# The SDK treats a thirdparty dependency as initialised when <dep>/.git exists.
+# libmspack is vendored as plain files at this pin, so it has no .git; the empty
+# marker directory satisfies the check without touching tracked content.
+if [ -d "$SDKSRC/thirdparty/libmspack" ] && [ ! -e "$SDKSRC/thirdparty/libmspack/.git" ]; then
+    mkdir -p "$SDKSRC/thirdparty/libmspack/.git"
+fi
 
 # SDL3 treats the X11 screensaver extension as required when X11 is enabled;
 # it only inhibits the screensaver, so build without it when libxss-dev is
