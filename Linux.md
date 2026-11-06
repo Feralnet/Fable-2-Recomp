@@ -193,11 +193,12 @@ changes), which costs nothing during normal play.
 
 - The ReXGlue SDK is built from the `thirdparty/rexglue-sdk` submodule as part
   of the game build, and the renderer is Vulkan only (no D3D12).
-- `build.sh` applies `thirdparty/rexglue-sdk-linux.patch` to the submodule.
-  It holds the build fixes the SDK fork needs on Linux plus Linux/Vulkan
-  performance fixes (cheaper write-watch fault handling, memexport readback
-  buffer reuse, less lock contention in the shared-memory path), so the
-  submodule shows as modified in `git status` after a build.
+- The submodule is pinned to `himdo/rexglue-sdk` `main`, which already carries
+  the Linux/Vulkan work (the SDK pull requests that used to be applied as
+  `thirdparty/rexglue-sdk-linux.patch`), so `build.sh` applies no SDK patch and
+  the submodule stays clean in `git status`.
+- The `thirdparty/rexglue-sdk-*.patch` and `thirdparty/sdk_*.patch` files in
+  the tree belong to the Windows/D3D12 lane; `build.sh` does not apply them.
 - The stable-hash PE cleaning, PDB staging and version-resource steps in
   `CMakeLists.txt` are Windows-only and are skipped.
 
