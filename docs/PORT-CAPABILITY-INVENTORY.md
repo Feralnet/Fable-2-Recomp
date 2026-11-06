@@ -1369,3 +1369,14 @@ For a true same-scene test this title needs one of: a save both arms load into t
 position; a scene with no rotating art; or per-frame capture aligned to a fixed game event. Until
 then, "the UI and boot are identical" is the honest claim, and "behaves identically in gameplay"
 is **not** — nobody has compared the same gameplay scene in both arms.
+
+---
+
+## 23. Cross-port companion — `~/wiki/gaming/port-tool-inventory.md`
+
+This page is the Fable-specific answer. The same sweep run across every port we hold is
+`~/wiki/gaming/port-tool-inventory.md` (2026-11-05, card `t_8512c344`). Two things it records that
+this page does not: the `launch.sh` run wrappers (`FABLE2_UNCAPPED`, `FABLE2_PADS`, `FABLE2_HUD`,
+`FABLE2_HUD_LOG`, `FABLE2_FPS_CAP`, `FABLE2_ARGS`) and the 39-file measurement suite in
+`NonSteam/Fable II/scripts/` (`perf-run.py`, `campaign.py`, `guest-ab.py`, `compare-frames.py`,
+`verify-21x9.py`, …). **When you add a capability here, add it there too.**
