@@ -148,6 +148,7 @@ extern "C" void MainRenderLoop_82B9CD68(PPCContext& ctx, uint8_t* base) {
   // Screenshot hotkey (--screenshot_key): consume a latched request once per
   // frame and read the guest output back on its own thread.
   fable2::screenshot::poll_capture();
+  fable2::console::poll(ctx, base);
   // Main-menu mod item: keep the relabeled row's string cache fresh.
   fable2::modmenu::on_frame(base);
   __imp__MainRenderLoop_82B9CD68(ctx, base);

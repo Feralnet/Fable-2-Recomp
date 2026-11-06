@@ -1,11 +1,12 @@
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
 import zipfile
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("package_release", ROOT / "tools/package_release.py")
 packager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packager)
@@ -28,7 +29,7 @@ class PackageReleaseTests(unittest.TestCase):
             self.build / "rexruntime.pdb": "symbols",
             self.build / "rexgpu-xenos.dll": "plugin",
             self.build / "rexgpu-xenos.pdb": "symbols",
-            self.build / "fable2_build.json": "{}",
+            self.build / "fable2_build.json": '{"profiles": ["goty"]}',
             self.build / "fable2_config.toml": "my own keybinds",
             self.build / "default.xex": "game code",
             self.build / "saves/slot1.sav": "save",
@@ -49,10 +50,12 @@ class PackageReleaseTests(unittest.TestCase):
         with zipfile.ZipFile(release) as archive:
             names = set(archive.namelist())
             config = archive.read("Fable 2 1.6.0/fable2_config.toml").decode()
+            build_info = json.loads(archive.read("Fable 2 1.6.0/fable2_build.json"))
         self.assertEqual(names, {f"Fable 2 1.6.0/{name}" for name in (
             "fable_2.exe", "rexruntime.dll", "rexgpu-xenos.dll", "fable2_build.json", "Fable2Launcher.exe",
             "README.md", "fable2_config.toml", "data/scripts/recomp/F5.lua")})
         self.assertEqual(config, "repo config")
+        self.assertEqual(build_info, {"profiles": ["goty"], "version": "1.6.0"})
 
     def test_symbols_are_separate(self):
         _, symbols = self.package()

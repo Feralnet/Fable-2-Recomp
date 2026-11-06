@@ -17,6 +17,7 @@
 #include <format>
 #include <fstream>
 #include <string_view>
+#include <type_traits>
 
 #include <rex/logging/macros.h>
 #include <rex/system.h>
@@ -301,7 +302,12 @@ T Read(const toml::table& section, std::string_view section_name,
   const toml::path key_path{key};
   const auto view = section[key_path];
   if (!view) return default_value;
-  if (auto v = view.value_exact<T>()) return static_cast<T>(*v);
+  if constexpr (std::is_same_v<T, double>) {
+    // Accept whole numbers too: camera_distance = 3 is a valid TOML integer.
+    if (auto v = view.value<double>()) return *v;
+  } else if (auto v = view.value_exact<T>()) {
+    return static_cast<T>(*v);
+  }
   REXSYS_WARN(
       "[fable2-config] [{}] {}: expected {}, got {}; using built-in default",
       section_name, key, type_name, TypeName(view.type()));
